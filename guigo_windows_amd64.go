@@ -132,6 +132,7 @@ type nativeWindow struct {
 	resources     map[*comObject]*comObject
 	initializing  bool
 	ready         bool
+	shown         bool
 	closing       bool
 	closed        bool
 	err           error
@@ -413,11 +414,6 @@ func run(parent context.Context, o Options) error {
 		return err
 	}
 	shell32.NewProc("DragAcceptFiles").Call(n.hwnd, 1)
-	show := uintptr(5)
-	if n.options.Maximized && !n.options.FixedSize {
-		show = 3
-	}
-	user32.NewProc("ShowWindow").Call(n.hwnd, show)
 	envCB := n.callback("{4E8A3389-C9D8-4BD2-B6B5-124FEE6CC14D}", func(hr uintptr, env *comObject) uintptr {
 		if n.ctx.Err() != nil {
 			n.initializing = false
@@ -944,6 +940,10 @@ func (n *nativeWindow) setup() error {
 		return 0
 	})
 	loaded := n.callback("{D33A35BF-1C49-4F98-93AB-006E0533FE1C}", func(_ uintptr, args *comObject) uintptr {
+		if n.ctx.Err() != nil {
+			n.fail(n.ctx.Err())
+			return 0
+		}
 		var success int32
 		com(args, 3, uintptr(unsafe.Pointer(&success)))
 		if success == 0 {
@@ -960,6 +960,14 @@ func (n *nativeWindow) setup() error {
 				com(n.webview, 32, uintptr(unsafe.Pointer(wide(event))))
 			}
 			n.pendingEvents = nil
+		}
+		if !n.shown {
+			n.shown = true
+			show := uintptr(5)
+			if n.options.Maximized && !n.options.FixedSize {
+				show = 3
+			}
+			user32.NewProc("ShowWindow").Call(n.hwnd, show)
 		}
 		return 0
 	})
