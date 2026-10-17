@@ -413,7 +413,11 @@ func run(parent context.Context, o Options) error {
 		return err
 	}
 	shell32.NewProc("DragAcceptFiles").Call(n.hwnd, 1)
-	user32.NewProc("ShowWindow").Call(n.hwnd, 5)
+	show := uintptr(5)
+	if n.options.Maximized && !n.options.FixedSize {
+		show = 3
+	}
+	user32.NewProc("ShowWindow").Call(n.hwnd, show)
 	envCB := n.callback("{4E8A3389-C9D8-4BD2-B6B5-124FEE6CC14D}", func(hr uintptr, env *comObject) uintptr {
 		if n.ctx.Err() != nil {
 			n.initializing = false

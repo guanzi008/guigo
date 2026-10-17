@@ -69,6 +69,8 @@ type Options struct {
 	FixedSize bool
 	// Center 在首次显示前按所在屏幕工作区居中，超出工作区的方向靠齐起点，不改变窗口尺寸
 	Center bool
+	// Maximized 指定首次显示时最大化，FixedSize启用时忽略
+	Maximized bool
 	// UserDataDir 指定持久数据目录，优先于AppID，两者至少设置一个，目录由调用方清理
 	// 相对路径基于当前工作目录，便携程序可传入可执行文件所在目录下的绝对路径
 	UserDataDir string
