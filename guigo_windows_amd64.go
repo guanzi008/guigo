@@ -750,9 +750,9 @@ func (n *nativeWindow) resize() {
 }
 
 // windowProc 处理Win32消息
-// 入参: hwnd 窗口句柄, msg 消息类型, wparam 数值参数, lparam 指针参数
+// 入参: hwnd 窗口句柄, msg 消息类型, wparam 消息参数, lparam 消息参数
 // 返回: uintptr 消息处理结果
-func windowProc(hwnd, msg, wparam uintptr, lparam unsafe.Pointer) uintptr {
+func windowProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 	n := active.Load()
 	if n != nil {
 		switch msg {
@@ -777,14 +777,14 @@ func windowProc(hwnd, msg, wparam uintptr, lparam unsafe.Pointer) uintptr {
 			return 0
 		case 0x2e0:
 			n.dpi = uint32(wparam & 0xffff)
-			r := (*rect)(lparam)
+			r := *(**rect)(unsafe.Pointer(&lparam))
 			user32.NewProc("SetWindowPos").Call(hwnd, 0, uintptr(r.Left), uintptr(r.Top), uintptr(r.Right-r.Left), uintptr(r.Bottom-r.Top), 0x14)
 			if err := n.updateIcons(); err != nil && n.options.OnError != nil {
 				go n.options.OnError(err)
 			}
 			return 0
 		case 0x24:
-			info := (*[5]point)(lparam)
+			info := *(**[5]point)(unsafe.Pointer(&lparam))
 			o := n.options
 			minw, minh, maxw, maxh := o.MinWidth, o.MinHeight, o.MaxWidth, o.MaxHeight
 			if o.FixedSize {
@@ -834,7 +834,7 @@ func windowProc(hwnd, msg, wparam uintptr, lparam unsafe.Pointer) uintptr {
 			return 0
 		}
 	}
-	r, _, _ := user32.NewProc("DefWindowProcW").Call(hwnd, msg, wparam, uintptr(lparam))
+	r, _, _ := user32.NewProc("DefWindowProcW").Call(hwnd, msg, wparam, lparam)
 	return r
 }
 
