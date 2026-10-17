@@ -1,4 +1,4 @@
-# GUIGo
+# GUIGo [![PkgGoDev](https://pkg.go.dev/badge/github.com/xiaoqidun/guigo)](https://pkg.go.dev/github.com/xiaoqidun/guigo)
 轻量、基于系统 WebView 的 Go 语言图形界面库
 
 # 授权协议
