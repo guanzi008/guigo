@@ -48,13 +48,13 @@ type temporaryDirectory struct {
 	closed bool
 }
 
-// temporaryFile 在句柄关闭后回收临时目录
+// temporaryFile 保存临时文件及所属目录
 type temporaryFile struct {
 	*os.File
 	directory *temporaryDirectory
 }
 
-// Close 关闭临时文件并尝试回收已结束的目录
+// Close 关闭临时文件并回收已停用的空目录
 // 返回: error 关闭错误
 func (f *temporaryFile) Close() error {
 	err := f.File.Close()
