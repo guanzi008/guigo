@@ -257,6 +257,9 @@ func (s *responseSpool) native(offset int64) (*comObject, error) {
 	hr, _, _ := ole32.NewProc("CoInitializeEx").Call(0, 0)
 	if hresult(hr) == nil {
 		defer ole32.NewProc("CoUninitialize").Call()
+	} else if uint32(hr) != 0x80010106 {
+		streamRelease(stream)
+		return nil, hresult(hr)
 	}
 	hr, _, _ = ole32.NewProc("CoCreateFreeThreadedMarshaler").Call(p, uintptr(unsafe.Pointer(&stream.marshal)))
 	if err := hresult(hr); err != nil {
@@ -270,8 +273,11 @@ func (s *responseSpool) native(offset int64) (*comObject, error) {
 // 入参: stream 原生流, iid 接口标识, out 接口输出
 // 返回: uintptr HRESULT结果
 func streamQuery(stream *nativeStream, iid *syscall.GUID, out **comObject) uintptr {
-	g := *iid
+	if out == nil {
+		return 0x80004003
+	}
 	*out = nil
+	g := *iid
 	if g == guid("{00000003-0000-0000-C000-000000000046}") && stream.marshal != nil {
 		return com(stream.marshal, 0, uintptr(unsafe.Pointer(iid)), uintptr(unsafe.Pointer(out)))
 	}
@@ -406,6 +412,7 @@ func streamClone(stream *nativeStream, out **comObject) uintptr {
 	if out == nil {
 		return 0x80030009
 	}
+	*out = nil
 	stream.mu.Lock()
 	defer stream.mu.Unlock()
 	cloned, err := stream.spool.native(stream.offset)
@@ -420,6 +427,9 @@ func streamClone(stream *nativeStream, out **comObject) uintptr {
 // 入参: stream 原生流, buffer 输入缓冲区, count 数据长度, written 写入长度输出
 // 返回: uintptr HRESULT结果
 func streamWrite(stream *nativeStream, buffer *byte, count uint32, written *uint32) uintptr {
+	if written != nil {
+		*written = 0
+	}
 	return 0x80030005
 }
 

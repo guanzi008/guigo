@@ -221,9 +221,12 @@ func utf16String(p *uint16) string {
 // 入参: c 回调对象, iid 接口标识, out 接口输出
 // 返回: uintptr HRESULT结果
 func callbackQuery(c *comCallback, iid *syscall.GUID, out **comCallback) uintptr {
+	if out == nil {
+		return 0x80004003
+	}
+	*out = nil
 	g := *iid
 	unknown := syscall.GUID{Data4: [8]byte{0xc0, 0, 0, 0, 0, 0, 0, 0x46}}
-	*out = nil
 	if g != unknown && g != c.IID {
 		return 0x80004002
 	}
