@@ -6,5 +6,8 @@
 go get -u github.com/xiaoqidun/guigo
 ```
 
+# 应用案例
+[OFDGo](https://github.com/xiaoqidun/ofdgo)：基于 GUIGo 构建桌面版 OFD、PDF 阅读与编辑工具
+
 # 授权协议
 本项目使用 [Apache License 2.0](https://github.com/xiaoqidun/guigo/blob/main/LICENSE) 授权协议
