@@ -37,10 +37,19 @@ var (
 	ErrClosed = errors.New("window closed")
 )
 
-// HandlerFunc 异步处理页面调用，窗口关闭时上下文取消
-// 入参: ctx 调用上下文, args JSON参数
-// 返回: any 可JSON编码的结果, error 错误信息
-type HandlerFunc func(context.Context, json.RawMessage) (any, error)
+// HandlerFunc 异步处理页面调用，调用结束、取消或页面退出时取消上下文
+// 返回带Discard的Result时，上下文保持到页面确认接收或调用取消
+// 入参: ctx 调用上下文, args 已解码参数，二进制为[]byte
+// 返回: any 可JSON编码的值或Result, error 错误信息
+type HandlerFunc func(context.Context, any) (any, error)
+
+// Result 保存调用结果及页面未接收时的资源释放操作
+type Result struct {
+	// Value 指定可JSON编码的结果
+	Value any
+	// Discard 在结果未交付时异步释放资源，页面确认接收后不再调用
+	Discard func()
+}
 
 // Options 定义窗口、资源和生命周期配置，客户区尺寸单位为逻辑像素
 type Options struct {
@@ -147,14 +156,15 @@ type Window struct {
 
 // envelope 表示双向消息信封
 type envelope struct {
-	ID        string          `json:"id,omitempty"`
-	Type      string          `json:"type"`
-	Name      string          `json:"name,omitempty"`
-	Args      json.RawMessage `json:"args,omitempty"`
-	Value     any             `json:"value"`
-	Error     string          `json:"error,omitempty"`
-	ErrorName string          `json:"errorName,omitempty"`
-	Code      string          `json:"code,omitempty"`
+	ID        string `json:"id,omitempty"`
+	Type      string `json:"type"`
+	Name      string `json:"name,omitempty"`
+	Args      any    `json:"args,omitempty"`
+	Binary    bool   `json:"binary,omitempty"`
+	Value     any    `json:"value"`
+	Error     string `json:"error,omitempty"`
+	ErrorName string `json:"errorName,omitempty"`
+	Code      string `json:"code,omitempty"`
 }
 
 // Error 返回错误说明
@@ -334,9 +344,9 @@ func validateDialog(o DialogOptions) error {
 }
 
 // dispatch 校验调用并隔离业务处理器异常
-// 入参: ctx 调用上下文, bindings 方法集合, raw 请求数据
+// 入参: ctx 调用上下文, bindings 方法集合, call 已解码请求
 // 返回: envelope 调用结果
-func dispatch(ctx context.Context, bindings map[string]HandlerFunc, raw []byte) (reply envelope) {
+func dispatch(ctx context.Context, bindings map[string]HandlerFunc, call envelope) (reply envelope) {
 	reply.Type = "reply"
 	defer func() {
 		if recover() != nil {
@@ -344,12 +354,11 @@ func dispatch(ctx context.Context, bindings map[string]HandlerFunc, raw []byte) 
 			reply.Value = nil
 		}
 	}()
-	var call envelope
-	if err := json.Unmarshal(raw, &call); err != nil {
-		reply.Error = "invalid JSON"
+	reply.ID = call.ID
+	if err := ctx.Err(); err != nil {
+		reply.Error, reply.ErrorName = err.Error(), "AbortError"
 		return
 	}
-	reply.ID = call.ID
 	if call.Type != "call" || call.ID == "" || call.Name == "" {
 		reply.Error = "invalid call"
 		return
@@ -358,9 +367,6 @@ func dispatch(ctx context.Context, bindings map[string]HandlerFunc, raw []byte) 
 	if handler == nil {
 		reply.Error = "unknown method: " + call.Name
 		return
-	}
-	if len(call.Args) == 0 {
-		call.Args = json.RawMessage("null")
 	}
 	value, err := handler(ctx, call.Args)
 	if err != nil {
@@ -373,7 +379,7 @@ func dispatch(ctx context.Context, bindings map[string]HandlerFunc, raw []byte) 
 			reply.ErrorName = bridge.Name
 			reply.Code = bridge.Code
 		}
-		if errors.Is(err, ErrCanceled) {
+		if errors.Is(err, ErrCanceled) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			reply.ErrorName = "AbortError"
 			reply.Code = "canceled"
 		}

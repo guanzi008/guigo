@@ -15,6 +15,7 @@
 package guigo
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -37,8 +38,10 @@ type requestBody struct {
 	window *nativeWindow
 	ctx    context.Context
 	object *comObject
-	buffer []byte
 }
+
+// memoryResource 提供内存响应的寻址和关闭操作
+type memoryResource struct{ *bytes.Reader }
 
 // streamReader 在所属COM线程读取原生IStream
 type streamReader struct {
@@ -53,6 +56,29 @@ type resourceWriter struct {
 	err    error
 }
 
+// Close 结束内存响应读取
+// 返回: error 关闭错误
+func (r *memoryResource) Close() error { return nil }
+
+// callResource 执行已登记的二进制调用并直接返回内存响应
+// 入参: calls 页面调用队列, r 资源请求
+// 返回: *Resource 调用响应, error 请求错误
+func (n *nativeWindow) callResource(calls *callQueue, r *http.Request) (*Resource, error) {
+	if calls == nil || r.Method != http.MethodPost {
+		return nil, fmt.Errorf("invalid binary request")
+	}
+	call := calls.take(r.URL.Query().Get("id"))
+	if call == nil {
+		return nil, fmt.Errorf("call is closed")
+	}
+	if body, ok := r.Body.(*requestBody); ok {
+		body.ctx = call.ctx
+	}
+	result := calls.run(call, n.options.Bindings, r.Body, r.ContentLength)
+	data := marshalReply(result)
+	return &Resource{Header: http.Header{"Content-Type": {"application/json"}, "Cache-Control": {"no-store"}}, Body: &memoryResource{bytes.NewReader(data)}}, nil
+}
+
 // Read 按需读取请求内容并在块间归还窗口线程
 // 入参: b 输出缓冲区
 // 返回: int 读取字节数, error 读取错误
@@ -62,10 +88,7 @@ func (r *requestBody) Read(b []byte) (int, error) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.buffer == nil {
-		r.buffer = make([]byte, 256<<10)
-	}
-	buffer := r.buffer[:min(len(b), len(r.buffer))]
+	buffer := b[:min(len(b), 256<<10)]
 	var count int
 	err := r.window.invoke(func() error {
 		if err := r.ctx.Err(); err != nil {
@@ -78,10 +101,6 @@ func (r *requestBody) Read(b []byte) (int, error) {
 		count, err = (streamReader{r.object}).Read(buffer)
 		return err
 	})
-	if err != nil && err != io.EOF {
-		return 0, err
-	}
-	copy(b, buffer[:count])
 	return count, err
 }
 
@@ -180,6 +199,7 @@ func (n *nativeWindow) resource(args *comObject) {
 	}
 	defer release(content)
 	requestContext := n.pageCtx
+	calls := n.calls
 	if requestContext == nil {
 		requestContext = n.ctx
 	}
@@ -238,7 +258,7 @@ func (n *nativeWindow) resource(args *comObject) {
 		if body != nil {
 			defer body.Close()
 		}
-		if localURL(uri) && n.options.ResourceHandler != nil {
+		if localURL(uri) && (n.options.ResourceHandler != nil || req.URL.Path == "/__guigo/call") {
 			var resource *Resource
 			func() {
 				defer func() {
@@ -246,7 +266,11 @@ func (n *nativeWindow) resource(args *comObject) {
 						err = fmt.Errorf("resource handler panic")
 					}
 				}()
-				resource, err = n.options.ResourceHandler(req)
+				if req.URL.Path == "/__guigo/call" {
+					resource, err = n.callResource(calls, req)
+				} else {
+					resource, err = n.options.ResourceHandler(req)
+				}
 			}()
 			if err != nil {
 				if resource != nil && resource.Body != nil {

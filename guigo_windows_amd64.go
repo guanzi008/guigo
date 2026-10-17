@@ -128,6 +128,7 @@ type nativeWindow struct {
 	generation    uint64
 	pageCtx       context.Context
 	pageCancel    context.CancelFunc
+	calls         *callQueue
 	pendingEvents []string
 	resources     map[*comObject]resourceRequest
 	temporary     temporaryDirectory
@@ -597,20 +598,15 @@ func (n *nativeWindow) enqueueCleanup(fn, discard func()) error {
 	return nil
 }
 
-// invoke 等待STA操作完成或窗口关闭
+// invoke 等待STA操作执行完成或被关闭流程丢弃
 // 入参: fn 待执行操作
 // 返回: error 执行错误
 func (n *nativeWindow) invoke(fn func() error) error {
 	result := make(chan error, 1)
-	if err := n.enqueue(func() { result <- fn() }); err != nil {
+	if err := n.enqueueCleanup(func() { result <- fn() }, func() { result <- ErrClosed }); err != nil {
 		return err
 	}
-	select {
-	case err := <-result:
-		return err
-	case <-n.done:
-		return ErrClosed
-	}
+	return <-result
 }
 
 // close 异步请求关闭
@@ -863,6 +859,7 @@ func (n *nativeWindow) setup() error {
 				n.pageCancel()
 			}
 			n.pageCtx, n.pageCancel = context.WithCancel(n.ctx)
+			n.calls = newCallQueue(n.pageCtx)
 			n.ready = false
 		}
 		return 0
@@ -892,22 +889,54 @@ func (n *nativeWindow) setup() error {
 		}
 		generation := n.generation
 		var message envelope
-		if json.Unmarshal([]byte(raw), &message) == nil && message.Type == "drop" {
+		if json.Unmarshal([]byte(raw), &message) != nil {
+			return 0
+		}
+		if message.Type == "drop" {
 			n.fileDrop(args)
 			return 0
 		}
-		ctx := n.pageCtx
-		if ctx == nil {
-			ctx = n.ctx
+		calls := n.calls
+		if calls == nil {
+			return 0
+		}
+		if message.Type == "cancel" {
+			calls.remove(message.ID)
+			return 0
+		}
+		if message.Type == "accept" {
+			calls.accept(message.ID)
+			return 0
+		}
+		if message.Type != "call" {
+			return 0
+		}
+		call, err := calls.add(message)
+		if err != nil {
+			b := marshalReply(envelope{ID: message.ID, Type: "reply", Error: err.Error()})
+			com(n.webview, 32, uintptr(unsafe.Pointer(wide(string(b)))))
+			return 0
+		}
+		if message.Binary {
+			b := marshalReply(envelope{ID: message.ID, Type: "upload"})
+			com(n.webview, 32, uintptr(unsafe.Pointer(wide(string(b)))))
+			return 0
 		}
 		go func() {
-			reply := dispatch(ctx, n.options.Bindings, []byte(raw))
+			reply := calls.run(call, n.options.Bindings, nil, 0)
 			b := marshalReply(reply)
-			_ = n.enqueue(func() {
+			err := n.enqueue(func() {
 				if generation == n.generation {
-					com(n.webview, 32, uintptr(unsafe.Pointer(wide(string(b)))))
+					if hresult(com(n.webview, 32, uintptr(unsafe.Pointer(wide(string(b)))))) != nil {
+						calls.remove(message.ID)
+					}
+				} else {
+					calls.remove(message.ID)
 				}
 			})
+			if err != nil {
+				calls.remove(message.ID)
+			}
 		}()
 		return 0
 	})
