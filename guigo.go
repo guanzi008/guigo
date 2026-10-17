@@ -164,7 +164,7 @@ func (e *BridgeError) Error() string {
 }
 
 // DefaultUserDataDir 返回应用的默认浏览器数据目录，不创建或删除目录
-// 目录位于os.UserCacheDir返回的位置下，使用guigo/app-应用标识作为子目录，Windows使用GUIGo目录名
+// 目录位于os.UserCacheDir返回的位置下，使用guigo/应用标识作为子目录，Windows使用GUIGo目录名
 // 入参: appID 稳定的应用标识
 // 返回: string 绝对目录路径, error 参数或路径错误
 func DefaultUserDataDir(appID string) (string, error) {
@@ -179,7 +179,7 @@ func DefaultUserDataDir(appID string) (string, error) {
 	if runtime.GOOS == "windows" {
 		name = "GUIGo"
 	}
-	return filepath.Abs(filepath.Join(base, name, "app-"+appID))
+	return filepath.Abs(filepath.Join(base, name, appID))
 }
 
 // OpenURL 使用系统默认浏览器打开http或https地址
