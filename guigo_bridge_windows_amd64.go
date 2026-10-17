@@ -15,7 +15,7 @@
 package guigo
 
 // resourceOrigin 为WebView2拦截的内部资源来源
-const resourceOrigin = "https://guigo.local"
+const resourceOrigin = "https://guigo.localhost"
 
 // bridgeScript 在文档创建时安装Promise调用桥与事件订阅
 const bridgeScript = `(() => {
