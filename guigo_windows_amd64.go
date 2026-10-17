@@ -129,7 +129,7 @@ type nativeWindow struct {
 	pageCtx       context.Context
 	pageCancel    context.CancelFunc
 	pendingEvents []string
-	resources     map[*comObject]*comObject
+	resources     map[*comObject]resourceRequest
 	temporary     temporaryDirectory
 	initializing  bool
 	ready         bool
@@ -902,7 +902,7 @@ func (n *nativeWindow) setup() error {
 		}
 		go func() {
 			reply := dispatch(ctx, n.options.Bindings, []byte(raw))
-			b, _ := json.Marshal(reply)
+			b := marshalReply(reply)
 			_ = n.enqueue(func() {
 				if generation == n.generation {
 					com(n.webview, 32, uintptr(unsafe.Pointer(wide(string(b)))))

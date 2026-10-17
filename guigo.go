@@ -379,12 +379,29 @@ func dispatch(ctx context.Context, bindings map[string]HandlerFunc, raw []byte) 
 		}
 		return
 	}
-	if _, err = json.Marshal(value); err != nil {
-		reply.Error = "result is not JSON encodable"
-		return
-	}
 	reply.Value = value
 	return
+}
+
+// marshalReply 编码调用结果并保留编码错误的响应标识
+// 入参: reply 调用结果
+// 返回: []byte 响应数据
+func marshalReply(reply envelope) (data []byte) {
+	defer func() {
+		if recover() != nil {
+			reply.Value = nil
+			reply.Error = "result is not JSON encodable"
+			data, _ = json.Marshal(reply)
+		}
+	}()
+	data, err := json.Marshal(reply)
+	if err == nil {
+		return data
+	}
+	reply.Value = nil
+	reply.Error = "result is not JSON encodable"
+	data, _ = json.Marshal(reply)
+	return data
 }
 
 // validateAppID 检查应用标识及目录字符限制

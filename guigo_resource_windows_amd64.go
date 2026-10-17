@@ -15,6 +15,7 @@
 package guigo
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,6 +24,21 @@ import (
 	"sync"
 	"unsafe"
 )
+
+// resourceRequest 保存异步资源请求及所属线程的请求流
+type resourceRequest struct {
+	deferral *comObject
+	body     *requestBody
+}
+
+// requestBody 按块在窗口线程读取请求内容
+type requestBody struct {
+	mu     sync.Mutex
+	window *nativeWindow
+	ctx    context.Context
+	object *comObject
+	buffer []byte
+}
 
 // streamReader 在所属COM线程读取原生IStream
 type streamReader struct {
@@ -35,6 +51,54 @@ type resourceWriter struct {
 	status int
 	spool  *responseSpool
 	err    error
+}
+
+// Read 按需读取请求内容并在块间归还窗口线程
+// 入参: b 输出缓冲区
+// 返回: int 读取字节数, error 读取错误
+func (r *requestBody) Read(b []byte) (int, error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.buffer == nil {
+		r.buffer = make([]byte, 256<<10)
+	}
+	buffer := r.buffer[:min(len(b), len(r.buffer))]
+	var count int
+	err := r.window.invoke(func() error {
+		if err := r.ctx.Err(); err != nil {
+			return err
+		}
+		if r.object == nil {
+			return io.ErrClosedPipe
+		}
+		var err error
+		count, err = (streamReader{r.object}).Read(buffer)
+		return err
+	})
+	if err != nil && err != io.EOF {
+		return 0, err
+	}
+	copy(b, buffer[:count])
+	return count, err
+}
+
+// WriteTo 分块传输请求内容
+// 入参: w 输出目标
+// 返回: int64 写入字节数, error 传输错误
+func (r *requestBody) WriteTo(w io.Writer) (int64, error) {
+	return io.CopyBuffer(struct{ io.Writer }{w}, struct{ io.Reader }{r}, make([]byte, 256<<10))
+}
+
+// Close 在窗口线程释放请求流
+// 返回: error 关闭错误
+func (r *requestBody) Close() error {
+	return r.window.enqueue(func() {
+		release(r.object)
+		r.object = nil
+	})
 }
 
 // Read 读取原生流并传播HRESULT
@@ -114,52 +178,29 @@ func (n *nativeWindow) resource(args *comObject) {
 		n.fail(err)
 		return
 	}
-	var body *temporaryFile
-	if content != nil {
-		body, err = n.temporary.create("request-")
-		if err == nil {
-			_, err = io.Copy(body, streamReader{content})
-		}
-		release(content)
-		if err != nil {
-			if body != nil {
-				body.Close()
-			}
-			n.fail(err)
-			return
-		}
-		_, err = body.Seek(0, 0)
-		if err != nil {
-			body.Close()
-			n.fail(err)
-			return
-		}
-	}
-	var input io.Reader
-	if body != nil {
-		input = body
-	}
+	defer release(content)
 	requestContext := n.pageCtx
 	if requestContext == nil {
 		requestContext = n.ctx
 	}
+	var body *requestBody
+	var input io.Reader
+	if content != nil {
+		body = &requestBody{window: n, ctx: requestContext, object: content}
+		input = body
+	}
 	req, err := http.NewRequestWithContext(requestContext, method, uri, input)
 	if err != nil {
-		if body != nil {
-			body.Close()
-		}
 		n.fail(err)
 		return
 	}
 	req.RequestURI = req.URL.RequestURI()
 	if body != nil {
-		info, err := body.Stat()
-		if err != nil {
-			body.Close()
-			n.fail(err)
-			return
+		req.ContentLength = -1
+		var stat streamStat
+		if hresult(com(content, 12, uintptr(unsafe.Pointer(&stat)), 1)) == nil && int64(stat.Size) >= 0 {
+			req.ContentLength = int64(stat.Size)
 		}
-		req.ContentLength = info.Size()
 	}
 	var headers, iterator *comObject
 	if hresult(com(request, 9, uintptr(unsafe.Pointer(&headers)))) == nil && headers != nil {
@@ -182,17 +223,17 @@ func (n *nativeWindow) resource(args *comObject) {
 	}
 	var deferral *comObject
 	if err := hresult(com(args, 6, uintptr(unsafe.Pointer(&deferral)))); err != nil {
-		if body != nil {
-			body.Close()
-		}
 		n.fail(err)
 		return
 	}
 	com(args, 1)
 	if n.resources == nil {
-		n.resources = make(map[*comObject]*comObject)
+		n.resources = make(map[*comObject]resourceRequest)
 	}
-	n.resources[args] = deferral
+	if content != nil {
+		com(content, 1)
+	}
+	n.resources[args] = resourceRequest{deferral: deferral, body: body}
 	go func() {
 		if body != nil {
 			defer body.Close()
@@ -314,10 +355,14 @@ func (n *nativeWindow) deliver(args *comObject, spool *responseSpool, status int
 // finishResource 完成原生异步资源请求
 // 入参: args 请求参数
 func (n *nativeWindow) finishResource(args *comObject) {
-	if deferral, ok := n.resources[args]; ok {
+	if request, ok := n.resources[args]; ok {
 		delete(n.resources, args)
-		com(deferral, 3)
-		release(deferral)
+		if request.body != nil {
+			release(request.body.object)
+			request.body.object = nil
+		}
+		com(request.deferral, 3)
+		release(request.deferral)
 		release(args)
 	}
 }
