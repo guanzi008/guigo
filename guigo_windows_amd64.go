@@ -59,6 +59,14 @@ type point struct {
 	Y int32
 }
 
+// monitorInfo 保存显示器范围和工作区
+type monitorInfo struct {
+	Size    uint32
+	Monitor rect
+	Work    rect
+	Flags   uint32
+}
+
 // message 对应Win32 MSG
 type message struct {
 	Window  uintptr
@@ -650,6 +658,13 @@ func (n *nativeWindow) setSize(w, h int) error {
 // initializeDPI 按实际窗口所在显示器校正初始客户区
 // 返回: error 初始化错误
 func (n *nativeWindow) initializeDPI() error {
+	var monitor uintptr
+	if n.options.Center {
+		monitor, _, _ = user32.NewProc("MonitorFromWindow").Call(n.hwnd, 2)
+		if monitor == 0 {
+			return errors.New("cannot determine window monitor")
+		}
+	}
 	proc := user32.NewProc("GetDpiForWindow")
 	if err := proc.Find(); err != nil {
 		return err
@@ -659,7 +674,45 @@ func (n *nativeWindow) initializeDPI() error {
 		return errors.New("cannot determine window DPI")
 	}
 	n.dpi = uint32(dpi)
-	return n.setClientSize(n.options.Width, n.options.Height)
+	if err := n.setClientSize(n.options.Width, n.options.Height); err != nil {
+		return err
+	}
+	if n.options.Center {
+		return n.center(monitor)
+	}
+	return nil
+}
+
+// center 按指定显示器工作区定位初始窗口
+// 入参: monitor 显示器句柄
+// 返回: error 定位错误
+func (n *nativeWindow) center(monitor uintptr) error {
+	info := monitorInfo{Size: uint32(unsafe.Sizeof(monitorInfo{}))}
+	ok, _, err := user32.NewProc("GetMonitorInfoW").Call(monitor, uintptr(unsafe.Pointer(&info)))
+	if ok == 0 {
+		return err
+	}
+	var bounds rect
+	ok, _, err = user32.NewProc("GetWindowRect").Call(n.hwnd, uintptr(unsafe.Pointer(&bounds)))
+	if ok == 0 {
+		return err
+	}
+	position := centerPosition(bounds, info.Work)
+	ok, _, err = user32.NewProc("SetWindowPos").Call(n.hwnd, 0, uintptr(position.X), uintptr(position.Y), 0, 0, 0x15)
+	if ok == 0 {
+		return err
+	}
+	return nil
+}
+
+// centerPosition 计算工作区内的窗口位置，保留负坐标显示器原点
+// 入参: bounds 窗口外框, work 显示器工作区
+// 返回: point 窗口左上角坐标
+func centerPosition(bounds, work rect) point {
+	return point{
+		X: work.Left + max(0, (work.Right-work.Left-(bounds.Right-bounds.Left))/2),
+		Y: work.Top + max(0, (work.Bottom-work.Top-(bounds.Bottom-bounds.Top))/2),
+	}
 }
 
 // setClientSize 在宿主线程应用逻辑客户区尺寸及约束
