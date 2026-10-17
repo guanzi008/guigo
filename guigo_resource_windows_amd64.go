@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -115,9 +114,9 @@ func (n *nativeWindow) resource(args *comObject) {
 		n.fail(err)
 		return
 	}
-	var body *os.File
+	var body *temporaryFile
 	if content != nil {
-		body, err = newTemporaryFile("guigo-request-")
+		body, err = n.temporary.create("request-")
 		if err == nil {
 			_, err = io.Copy(body, streamReader{content})
 		}
@@ -242,7 +241,7 @@ func (n *nativeWindow) resource(args *comObject) {
 				return
 			}
 		}
-		spool, err := newResponseSpool(req.Context())
+		spool, err := newResponseSpool(req.Context(), &n.temporary)
 		if err != nil {
 			_ = n.enqueue(func() {
 				n.finishResource(args)

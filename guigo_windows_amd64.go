@@ -130,6 +130,7 @@ type nativeWindow struct {
 	pageCancel    context.CancelFunc
 	pendingEvents []string
 	resources     map[*comObject]*comObject
+	temporary     temporaryDirectory
 	initializing  bool
 	ready         bool
 	shown         bool
@@ -305,6 +306,7 @@ func run(parent context.Context, o Options) error {
 		}
 	}
 	n.ctx, n.cancel = context.WithCancel(parent)
+	defer n.temporary.close()
 	defer n.cancel()
 	hr, _, _ := ole32.NewProc("CoInitializeEx").Call(0, 2)
 	if err := hresult(hr); err != nil {

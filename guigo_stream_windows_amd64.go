@@ -17,7 +17,9 @@ package guigo
 import (
 	"context"
 	"crypto/rand"
+	"fmt"
 	"io"
+	"math/big"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -38,6 +40,41 @@ var (
 	streamRoots sync.Map
 	streamTable [14]uintptr
 )
+
+// temporaryDirectory 管理当前窗口的临时文件目录
+type temporaryDirectory struct {
+	mu     sync.Mutex
+	path   string
+	closed bool
+}
+
+// temporaryFile 在句柄关闭后回收临时目录
+type temporaryFile struct {
+	*os.File
+	directory *temporaryDirectory
+}
+
+// Close 关闭临时文件并尝试回收已结束的目录
+// 返回: error 关闭错误
+func (f *temporaryFile) Close() error {
+	err := f.File.Close()
+	f.directory.mu.Lock()
+	defer f.directory.mu.Unlock()
+	if f.directory.closed {
+		os.Remove(f.directory.path)
+	}
+	return err
+}
+
+// close 停止创建临时文件并回收空目录
+func (d *temporaryDirectory) close() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.closed = true
+	if d.path != "" {
+		os.Remove(d.path)
+	}
+}
 
 // responseSpool 为生产者和原生流提供有界内存的可寻址共享存储
 type responseSpool struct {
@@ -96,12 +133,38 @@ func init() {
 	}
 }
 
-// newTemporaryFile 创建句柄关闭后由系统删除的临时文件
+// create 创建句柄关闭后由系统删除的临时文件
 // 入参: prefix 文件名前缀
-// 返回: *os.File 临时文件, error 创建错误
-func newTemporaryFile(prefix string) (*os.File, error) {
-	for i := 0; i < 10; i++ {
-		path := filepath.Join(os.TempDir(), prefix+rand.Text())
+// 返回: *temporaryFile 临时文件, error 创建错误
+func (d *temporaryDirectory) create(prefix string) (*temporaryFile, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return nil, os.ErrClosed
+	}
+	for i := 0; d.path == "" && i < 100; i++ {
+		n, err := rand.Int(rand.Reader, big.NewInt(10000000))
+		if err != nil {
+			return nil, err
+		}
+		path := filepath.Join(os.TempDir(), fmt.Sprintf("guigo-%07d", n.Int64()))
+		if err := os.Mkdir(path, 0700); err != nil {
+			if os.IsExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		d.path = path
+	}
+	if d.path == "" {
+		return nil, os.ErrExist
+	}
+	for i := 0; i < 100; i++ {
+		n, err := rand.Int(rand.Reader, big.NewInt(10000000))
+		if err != nil {
+			return nil, err
+		}
+		path := filepath.Join(d.path, fmt.Sprintf("%s%07d.tmp", prefix, n.Int64()))
 		handle, err := syscall.CreateFile(wide(path), temporaryFileAccess, syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE|syscall.FILE_SHARE_DELETE, nil, syscall.CREATE_NEW, temporaryFileFlags, 0)
 		if err == syscall.ERROR_FILE_EXISTS || err == syscall.ERROR_ALREADY_EXISTS {
 			continue
@@ -109,16 +172,16 @@ func newTemporaryFile(prefix string) (*os.File, error) {
 		if err != nil {
 			return nil, err
 		}
-		return os.NewFile(uintptr(handle), path), nil
+		return &temporaryFile{File: os.NewFile(uintptr(handle), path), directory: d}, nil
 	}
 	return nil, os.ErrExist
 }
 
 // newResponseSpool 创建可增量读取的临时存储
-// 入参: ctx 运行上下文
+// 入参: ctx 运行上下文, directory 临时目录
 // 返回: *responseSpool 响应存储, error 创建错误
-func newResponseSpool(ctx context.Context) (*responseSpool, error) {
-	file, err := newTemporaryFile("guigo-stream-")
+func newResponseSpool(ctx context.Context, directory *temporaryDirectory) (*responseSpool, error) {
+	file, err := directory.create("stream-")
 	if err != nil {
 		return nil, err
 	}
