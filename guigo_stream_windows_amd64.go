@@ -54,28 +54,6 @@ type temporaryFile struct {
 	directory *temporaryDirectory
 }
 
-// Close 关闭临时文件并回收已停用的空目录
-// 返回: error 关闭错误
-func (f *temporaryFile) Close() error {
-	err := f.File.Close()
-	f.directory.mu.Lock()
-	defer f.directory.mu.Unlock()
-	if f.directory.closed {
-		os.Remove(f.directory.path)
-	}
-	return err
-}
-
-// close 停止创建临时文件并回收空目录
-func (d *temporaryDirectory) close() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.closed = true
-	if d.path != "" {
-		os.Remove(d.path)
-	}
-}
-
 // responseSpool 为生产者和原生流提供有界内存的可寻址共享存储
 type responseSpool struct {
 	mu       sync.Mutex
@@ -111,6 +89,28 @@ type streamStat struct {
 	Class    syscall.GUID
 	State    uint32
 	Reserved uint32
+}
+
+// Close 关闭临时文件并回收已停用的空目录
+// 返回: error 关闭错误
+func (f *temporaryFile) Close() error {
+	err := f.File.Close()
+	f.directory.mu.Lock()
+	defer f.directory.mu.Unlock()
+	if f.directory.closed {
+		os.Remove(f.directory.path)
+	}
+	return err
+}
+
+// close 停止创建临时文件并回收空目录
+func (d *temporaryDirectory) close() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.closed = true
+	if d.path != "" {
+		os.Remove(d.path)
+	}
 }
 
 // init 固定原生流回调入口
