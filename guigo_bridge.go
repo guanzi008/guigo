@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package guigo
+//go:build (windows || linux) && amd64
 
-// resourceOrigin 为WebView2拦截的内部资源来源
-const resourceOrigin = "https://guigo.localhost"
+package guigo
 
 // bridgeScript 在文档创建时安装Promise调用桥与事件订阅
 const bridgeScript = `(() => {
@@ -150,7 +149,7 @@ const bridgeScript = `(() => {
 						const cleanup = () => signal?.removeEventListener("abort", abort);
 						const upload = async () => {
 							try {
-								const response = await fetch("/__guigo/call?id=" + id, {method:"POST", body, signal});
+								const response = await fetch("/__guigo/call?id=" + id, {method:"POST", body, signal, headers:{"X-Guigo-Length":String(data.size)}});
 								if (!response.ok) throw new Error("binary call failed");
 								settle(await response.json());
 							} catch (error) {

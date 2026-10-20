@@ -15,9 +15,13 @@
 package guigo
 
 import (
+	"net/http"
 	"net/url"
 	"strings"
 )
+
+// fileHandler 标识由宿主选项自动创建的静态文件处理器
+type fileHandler struct{ http.Handler }
 
 // localResource 判断资源是否属于指定宿主来源
 // 入参: origin 宿主来源, raw 资源地址

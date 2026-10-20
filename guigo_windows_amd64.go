@@ -29,6 +29,9 @@ import (
 	"unsafe"
 )
 
+// resourceOrigin 为WebView2拦截的内部资源来源
+const resourceOrigin = "https://guigo.localhost"
+
 var (
 	user32        = syscall.NewLazyDLL("user32.dll")
 	ole32         = syscall.NewLazyDLL("ole32.dll")

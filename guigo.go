@@ -70,13 +70,14 @@ type Options struct {
 	MinWidth int
 	// MinHeight 指定最小客户区高度，零值表示不限制
 	MinHeight int
-	// MaxWidth 指定最大客户区宽度，零值表示不限制
+	// MaxWidth 指定最大客户区宽度，零值表示不限制，Linux仅约束初始尺寸及SetSize
 	MaxWidth int
-	// MaxHeight 指定最大客户区高度，零值表示不限制
+	// MaxHeight 指定最大客户区高度，零值表示不限制，Linux仅约束初始尺寸及SetSize
 	MaxHeight int
 	// FixedSize 禁止用户调整窗口大小，程序仍可调用SetSize
 	FixedSize bool
 	// Center 在首次显示前按所在屏幕工作区居中，超出工作区的方向靠齐起点，不改变窗口尺寸
+	// Linux由窗口管理器决定窗口位置，GTK4不支持强制居中
 	Center bool
 	// Maximized 指定首次显示时最大化，FixedSize启用时忽略
 	Maximized bool
@@ -202,7 +203,8 @@ func OpenURL(rawURL string) error {
 	return openURL(rawURL)
 }
 
-// Run 在调用线程运行窗口事件循环，关闭后返回，同一进程不支持同时运行多个实例
+// Run 运行窗口事件循环，关闭后返回，同一进程不支持同时运行多个实例
+// Windows使用调用线程，Linux使用进程内固定的GTK线程
 // 浏览器数据在关闭、启动失败和版本升级时保留，删除由调用方负责
 // 入参: ctx 运行上下文, options 宿主选项
 // 返回: error 启动、运行或上下文错误
@@ -477,7 +479,7 @@ func validate(o *Options) error {
 	}
 	if o.Handler == nil {
 		if o.FS != nil {
-			o.Handler = http.FileServer(http.FS(o.FS))
+			o.Handler = fileHandler{http.FileServer(http.FS(o.FS))}
 		} else {
 			o.Handler = http.NotFoundHandler()
 		}
