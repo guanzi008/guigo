@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build amd64 || arm64
+
 package guigo
 
 import (
@@ -723,6 +725,7 @@ func linuxDrop(target, value uintptr, x, y float64, data uintptr) uintptr {
 		return 0
 	}
 	list := gtk.DropFiles(gtk.ValueBoxed(value))
+	defer gtk.ListFree(list)
 	var paths []string
 	for list != nil {
 		p := gtk.FilePath(list.Data)

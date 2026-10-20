@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build amd64 || arm64
+
 package guigo
 
 import (
@@ -155,6 +157,7 @@ type linuxAPI struct {
 	DropNew          func(uintptr, uint32) uintptr                                             `symbol:"gtk_drop_target_new"`
 	DropType         func() uintptr                                                            `symbol:"gdk_file_list_get_type"`
 	DropFiles        func(uintptr) *linuxList                                                  `symbol:"gdk_file_list_get_files"`
+	ListFree         func(*linuxList)                                                          `symbol:"g_slist_free"`
 	ValueBoxed       func(uintptr) uintptr                                                     `symbol:"g_value_get_boxed"`
 	ControllerPhase  func(uintptr, int32)                                                      `symbol:"gtk_event_controller_set_propagation_phase"`
 	AddController    func(uintptr, uintptr)                                                    `symbol:"gtk_widget_add_controller"`
