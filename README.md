@@ -11,7 +11,7 @@ go get -u github.com/xiaoqidun/guigo
 
 # 系统依赖
 ## Windows
-需安装 [Microsoft Edge WebView2](https://developer.microsoft.com/zh-cn/microsoft-edge/webview2)
+系统未内置时需安装 [Microsoft Edge WebView2](https://developer.microsoft.com/zh-cn/microsoft-edge/webview2)
 
 ## Linux（Debian 13，Ubuntu 24.04/26.04）
 ```shell
