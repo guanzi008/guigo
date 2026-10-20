@@ -13,7 +13,7 @@ go get -u github.com/xiaoqidun/guigo
 ## Windows
 需安装 [Microsoft Edge WebView2](https://developer.microsoft.com/zh-cn/microsoft-edge/webview2)
 
-## Linux（Debian 13）
+## Linux（Debian 13，Ubuntu 24.04/26.04）
 ```shell
 apt-get install libwebkitgtk-6.0-4
 ```
