@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -43,6 +44,7 @@ var linuxThread sync.Once
 var linuxRuns = make(chan linuxRun)
 var linuxCallbacks = struct {
 	tick, closing, closed, loaded, message, scheme, headers, policy, failed, dialog, drop, loadFailed, startup uintptr
+	titleChanged, titlePosition, dragPosition                                                                  uintptr
 }{}
 
 // nativeWindow 保存GTK线程拥有的窗口及页面状态
@@ -56,11 +58,21 @@ type nativeWindow struct {
 	done                                             chan struct{}
 	window, view, manager, webContext, session, loop uintptr
 	dropTarget                                       uintptr
+	captionOverlay, dragOverlay                      uintptr
+	captionControls                                  [2]uintptr
+	captionStyle, captionDisplay                     uintptr
+	dragHandles                                      []linuxDragHandle
+	titleInfo                                        TitleBarInfo
+	titleScale                                       int32
+	titleCallbacksReady                              bool
+	titleInfoSet, titleUpdatePending                 bool
+	titleCallbackRunning, titleCallbackPending       bool
 	pageCtx                                          context.Context
 	pageCancel                                       context.CancelFunc
 	calls                                            *callQueue
 	generation                                       uint64
 	ready, closing                                   bool
+	closePending                                     bool
 	pendingEvents                                    []string
 	resources                                        map[uintptr]bool
 	dialogsPending                                   map[uintptr]*linuxDialog
@@ -85,6 +97,12 @@ type linuxRun struct {
 	result  chan error
 }
 
+// linuxDragHandle 保存由GTK原生标题栏手势处理的内容区矩形
+type linuxDragHandle struct {
+	widget uintptr
+	region Rect
+}
+
 // init 注册进程生命周期内复用的原生回调
 func init() {
 	linuxCallbacks.tick = purego.NewCallback(linuxTick)
@@ -100,6 +118,9 @@ func init() {
 	linuxCallbacks.drop = purego.NewCallback(linuxDrop)
 	linuxCallbacks.loadFailed = purego.NewCallback(linuxLoadFailed)
 	linuxCallbacks.startup = purego.NewCallback(linuxStartupTimeout)
+	linuxCallbacks.titleChanged = purego.NewCallback(linuxTitleChanged)
+	linuxCallbacks.titlePosition = purego.NewCallback(linuxTitlePosition)
+	linuxCallbacks.dragPosition = purego.NewCallback(linuxDragPosition)
 }
 
 // run 在固定GTK线程创建窗口并等待退出
@@ -203,7 +224,8 @@ func runLinux(parent context.Context, o Options) error {
 	gtk.Size(n.window, int32(o.Width), int32(o.Height))
 	gtk.Minimum(n.view, int32(o.MinWidth), int32(o.MinHeight))
 	gtk.Resizable(n.window, !o.FixedSize)
-	gtk.Child(n.window, n.view)
+	n.initTitleBar()
+	defer n.freeTitleBarColors()
 	if len(data) != 0 {
 		n.iconDir, err = linuxIconDirectory()
 		if err != nil {
@@ -256,6 +278,7 @@ func runLinux(parent context.Context, o Options) error {
 				o.OnReady(&Window{native: n})
 			}()
 		}
+		n.startTitleCallbacks()
 		_ = n.enqueue(func() {
 			n.startupTimer = gtk.Timeout(0, 30000, linuxCallbacks.startup, 0, 0)
 			gtk.Load(n.view, resourceURL(o.EntryPath))
@@ -549,9 +572,10 @@ func linuxClosing(window, data uintptr) uintptr {
 	return 1
 }
 
-// requestClose 异步检查业务关闭回调并触发beforeunload
+// requestClose 异步检查业务关闭回调，保留校验期间的新请求并触发beforeunload
 func (n *nativeWindow) requestClose() {
 	if n.closing {
+		n.closePending = true
 		return
 	}
 	n.closing = true
@@ -570,9 +594,15 @@ func (n *nativeWindow) requestClose() {
 		}
 		_ = n.enqueue(func() {
 			n.closing = false
-			if allow {
-				gtk.TryClose(n.view)
+			pending := n.closePending
+			n.closePending = false
+			if !allow {
+				if pending {
+					n.requestClose()
+				}
+				return
 			}
+			gtk.TryClose(n.view)
 		})
 	}()
 }
@@ -643,6 +673,258 @@ func (n *nativeWindow) setSize(width, height int) error {
 		height = min(height, o.MaxHeight)
 	}
 	return n.enqueue(func() { gtk.Size(n.window, int32(width), int32(height)) })
+}
+
+// initTitleBar 在单个WebView上方叠放原生控件并保留GTK客户区装饰
+func (n *nativeWindow) initTitleBar() {
+	if n.options.TitleBar == TitleBarContent {
+		titlebar := gtk.BoxNew(0, 0)
+		gtk.Titlebar(n.window, titlebar)
+		gtk.Visible(titlebar, false)
+		n.dragOverlay = gtk.OverlayNew()
+		gtk.OverlayChild(n.dragOverlay, n.view)
+		n.captionOverlay = gtk.OverlayNew()
+		gtk.OverlayChild(n.captionOverlay, n.dragOverlay)
+		for side := range n.captionControls {
+			controls := gtk.WindowControls(int32(side))
+			n.captionControls[side] = controls
+			gtk.OverlayAdd(n.captionOverlay, controls)
+			gtk.Connect(controls, "notify::empty", linuxCallbacks.titleChanged, 0, 0, 0)
+		}
+		n.initTitleBarColors()
+		gtk.Connect(n.captionOverlay, "get-child-position", linuxCallbacks.titlePosition, 0, 0, 0)
+		gtk.Connect(n.dragOverlay, "get-child-position", linuxCallbacks.dragPosition, 0, 0, 0)
+		gtk.Child(n.window, n.captionOverlay)
+	} else {
+		gtk.Child(n.window, n.view)
+	}
+	gtk.Connect(n.window, "notify::is-active", linuxCallbacks.titleChanged, 0, 0, 0)
+	gtk.Connect(n.window, "notify::maximized", linuxCallbacks.titleChanged, 0, 0, 0)
+	gtk.Connect(n.window, "notify::scale-factor", linuxCallbacks.titleChanged, 0, 0, 0)
+	n.updateTitleInfo()
+}
+
+// initTitleBarColors 仅为当前窗口按钮附加配色，不改动主题按钮的尺寸和交互状态
+func (n *nativeWindow) initTitleBarColors() {
+	colors := n.options.TitleBarColors
+	if colors == (TitleBarColors{}) {
+		return
+	}
+	n.captionStyle, n.captionDisplay = gtk.CSSProviderNew(), gtk.Display(n.window)
+	css := fmt.Sprintf(".guigo-caption { background-color: %s; color: %s; } .guigo-caption:backdrop { background-color: %s; color: %s; } .guigo-caption button:not(:hover):not(:active) { color: inherit; }", colors.Background, colors.Foreground, colors.InactiveBackground, colors.InactiveForeground)
+	gtk.CSSLoad(n.captionStyle, css, int64(len(css)))
+	gtk.CSSAdd(n.captionDisplay, n.captionStyle, 600)
+	for _, controls := range n.captionControls {
+		gtk.CSSClass(controls, "guigo-caption")
+	}
+}
+
+// freeTitleBarColors 移除显示器上的临时样式并释放当前窗口持有的引用
+func (n *nativeWindow) freeTitleBarColors() {
+	if n.captionStyle != 0 {
+		gtk.CSSRemove(n.captionDisplay, n.captionStyle)
+		gtk.Unref(n.captionStyle)
+		n.captionStyle, n.captionDisplay = 0, 0
+	}
+}
+
+// titleBarInfo 读取最后一次GTK布局及窗口状态，不跨线程访问原生对象
+// 返回: TitleBarInfo 标题栏信息, error 关闭错误
+func (n *nativeWindow) titleBarInfo() (TitleBarInfo, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.closed {
+		return TitleBarInfo{}, ErrClosed
+	}
+	return n.titleInfo, nil
+}
+
+// setDragRegions 复制逻辑像素区域并交给GTK原生WindowHandle处理真实输入事件
+// GTK手势使用实际GdkEvent的设备、时间戳和原生坐标，保留系统双击动作及窗口菜单
+// 入参: regions 客户区拖动矩形，空切片清除全部区域
+// 返回: error 模式、参数或关闭错误
+func (n *nativeWindow) setDragRegions(regions []Rect) error {
+	if n.options.TitleBar != TitleBarContent {
+		return errors.New("content title bar is not enabled")
+	}
+	regions = append([]Rect(nil), regions...)
+	for _, r := range regions {
+		if math.IsNaN(r.X) || math.IsNaN(r.Y) || math.IsNaN(r.Width) || math.IsNaN(r.Height) ||
+			math.IsInf(r.X, 0) || math.IsInf(r.Y, 0) || math.IsInf(r.Width, 0) || math.IsInf(r.Height, 0) ||
+			r.Width < 0 || r.Height < 0 {
+			return errors.New("invalid drag region")
+		}
+	}
+	return n.enqueue(func() {
+		for _, handle := range n.dragHandles {
+			gtk.OverlayRemove(n.dragOverlay, handle.widget)
+		}
+		n.dragHandles = nil
+		for _, region := range regions {
+			if region.Width == 0 || region.Height == 0 {
+				continue
+			}
+			handle := gtk.WindowHandle()
+			n.dragHandles = append(n.dragHandles, linuxDragHandle{widget: handle, region: region})
+			gtk.OverlayAdd(n.dragOverlay, handle)
+		}
+	})
+}
+
+// measureTitleControls 测量主题和系统按钮布局决定的标题栏逻辑尺寸
+// 返回: int32 高度, [2]int32 左右原生控件宽度
+func (n *nativeWindow) measureTitleControls() (int32, [2]int32) {
+	height := int32(32)
+	var widths [2]int32
+	for side, controls := range n.captionControls {
+		if controls == 0 || gtk.ControlsEmpty(controls) {
+			continue
+		}
+		var minimum, natural int32
+		gtk.Measure(controls, 0, -1, &minimum, &natural, nil, nil)
+		widths[side] = max(minimum, natural)
+		gtk.Measure(controls, 1, widths[side], &minimum, &natural, nil, nil)
+		height = max(height, minimum, natural)
+	}
+	return height, widths
+}
+
+// updateTitleInfo 更新缓存并在后台发送变化通知，避免业务回调阻塞GTK线程
+func (n *nativeWindow) updateTitleInfo() {
+	n.titleUpdatePending = false
+	scale := gtk.ScaleFactor(n.window)
+	info := TitleBarInfo{Active: gtk.IsActive(n.window), Maximized: gtk.IsMaximized(n.window)}
+	if n.options.TitleBar == TitleBarContent {
+		info.Colors = n.options.TitleBarColors
+		height, widths := n.measureTitleControls()
+		info.Height, info.Left, info.Right = float64(height), float64(widths[0]), float64(widths[1])
+		if n.captionOverlay != 0 {
+			gtk.Minimum(n.captionOverlay, widths[0]+widths[1], height)
+		}
+	}
+	n.mu.Lock()
+	if n.closed || n.titleInfoSet && n.titleInfo == info && n.titleScale == scale {
+		n.mu.Unlock()
+		return
+	}
+	n.titleInfo, n.titleInfoSet, n.titleScale = info, true, scale
+	start := false
+	if n.options.OnTitleBarChanged != nil {
+		n.titleCallbackPending = true
+		start = n.titleCallbacksReady && !n.titleCallbackRunning
+		if start {
+			n.titleCallbackRunning = true
+		}
+	}
+	n.mu.Unlock()
+	if start {
+		go n.deliverTitleInfo()
+	}
+}
+
+// startTitleCallbacks 在OnReady返回后开放初始通知及后续状态的串行投递
+func (n *nativeWindow) startTitleCallbacks() {
+	n.mu.Lock()
+	n.titleCallbacksReady = true
+	start := !n.closed && n.titleCallbackPending && !n.titleCallbackRunning
+	if start {
+		n.titleCallbackRunning = true
+	}
+	n.mu.Unlock()
+	if start {
+		go n.deliverTitleInfo()
+	}
+}
+
+// deliverTitleInfo 串行通知最新标题栏状态并隔离业务异常，关闭后丢弃未交付状态
+func (n *nativeWindow) deliverTitleInfo() {
+	for {
+		n.mu.Lock()
+		if n.closed || !n.titleCallbackPending || n.ctx.Err() != nil || active.Load() != n {
+			n.titleCallbackRunning = false
+			n.titleCallbackPending = false
+			n.mu.Unlock()
+			return
+		}
+		info := n.titleInfo
+		n.titleCallbackPending = false
+		n.mu.Unlock()
+		func() {
+			defer func() {
+				if v := recover(); v != nil {
+					n.fail(fmt.Errorf("OnTitleBarChanged panic: %v", v))
+				}
+			}()
+			n.options.OnTitleBarChanged(info)
+		}()
+	}
+}
+
+// queueTitleInfo 合并同一轮原生状态及布局变化通知
+func (n *nativeWindow) queueTitleInfo() {
+	if !n.titleUpdatePending {
+		n.titleUpdatePending = true
+		_ = n.enqueue(n.updateTitleInfo)
+	}
+}
+
+// linuxTitleChanged 跟踪当前窗口及原生按钮布局变化
+// 入参: object 原生对象, property 属性定义, data 用户数据
+func linuxTitleChanged(object, property, data uintptr) {
+	n := active.Load()
+	if n != nil && (object == n.window || object == n.captionControls[0] || object == n.captionControls[1]) {
+		n.queueTitleInfo()
+	}
+}
+
+// linuxTitlePosition 将真实GTK控件分配在内容区顶部的左右两侧
+// 入参: overlay 叠放容器, child 原生控件, allocation 输出分配区域, data 用户数据
+// 返回: uintptr 是否提供分配区域
+func linuxTitlePosition(overlay, child uintptr, allocation *linuxRectangle, data uintptr) uintptr {
+	n := active.Load()
+	if n == nil || overlay != n.captionOverlay || allocation == nil {
+		return 0
+	}
+	height, widths := n.measureTitleControls()
+	for side, controls := range n.captionControls {
+		if child == controls {
+			*allocation = linuxRectangle{Width: widths[side], Height: height}
+			if side == 1 {
+				allocation.X = gtk.WidgetWidth(overlay) - allocation.Width
+			}
+			n.queueTitleInfo()
+			return 1
+		}
+	}
+	return 0
+}
+
+// linuxDragPosition 将拖动命中区裁剪到WebView逻辑坐标，不包含窗口阴影和原生边框
+// 入参: overlay 叠放容器, child 拖动控件, allocation 输出分配区域, data 用户数据
+// 返回: uintptr 是否提供分配区域
+func linuxDragPosition(overlay, child uintptr, allocation *linuxRectangle, data uintptr) uintptr {
+	n := active.Load()
+	if n == nil || overlay != n.dragOverlay || allocation == nil {
+		return 0
+	}
+	for _, handle := range n.dragHandles {
+		if child == handle.widget {
+			*allocation = linuxClipDragRegion(handle.region, gtk.WidgetWidth(n.view), gtk.WidgetHeight(n.view))
+			return 1
+		}
+	}
+	return 0
+}
+
+// linuxClipDragRegion 向内取整并裁剪区域，避免将相邻交互内容作为拖动命中区
+// 入参: region 逻辑矩形, width 内容宽度, height 内容高度
+// 返回: linuxRectangle GTK分配区域
+func linuxClipDragRegion(region Rect, width, height int32) linuxRectangle {
+	x := math.Ceil(max(0, min(float64(width), region.X)))
+	y := math.Ceil(max(0, min(float64(height), region.Y)))
+	right := math.Floor(max(x, min(float64(width), region.X+region.Width)))
+	bottom := math.Floor(max(y, min(float64(height), region.Y+region.Height)))
+	return linuxRectangle{X: int32(x), Y: int32(y), Width: int32(right - x), Height: int32(bottom - y)}
 }
 
 // openURL 使用系统浏览器打开外部链接

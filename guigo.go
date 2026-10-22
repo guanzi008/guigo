@@ -17,15 +17,24 @@ package guigo
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"io/fs"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+)
+
+const (
+	// TitleBarSystem 使用系统标题栏，为默认值
+	TitleBarSystem TitleBarMode = iota
+	// TitleBarContent 将内容延伸到标题栏，保留系统窗口按钮
+	TitleBarContent
 )
 
 var (
@@ -51,6 +60,49 @@ type Result struct {
 	Discard func()
 }
 
+// TitleBarMode 定义窗口标题栏的显示方式
+type TitleBarMode uint8
+
+// TitleBarColors 定义内容标题栏的激活及失焦配色，颜色使用#RRGGBB格式
+type TitleBarColors struct {
+	// Background 指定激活时的背景色
+	Background string `json:"background"`
+	// Foreground 指定激活时的前景色
+	Foreground string `json:"foreground"`
+	// InactiveBackground 指定失焦时的背景色
+	InactiveBackground string `json:"inactiveBackground"`
+	// InactiveForeground 指定失焦时的前景色
+	InactiveForeground string `json:"inactiveForeground"`
+}
+
+// Rect 定义相对客户区左上角的逻辑像素矩形，不随页面缩放变化
+type Rect struct {
+	// X 指定矩形左边位置
+	X float64 `json:"x"`
+	// Y 指定矩形上边位置
+	Y float64 `json:"y"`
+	// Width 指定非负矩形宽度，零值表示空矩形
+	Width float64 `json:"width"`
+	// Height 指定非负矩形高度，零值表示空矩形
+	Height float64 `json:"height"`
+}
+
+// TitleBarInfo 保存逻辑像素标题栏布局和窗口状态
+type TitleBarInfo struct {
+	// Height 指定内容标题栏实际高度，系统模式为零，不保证最小高度，随DPI及最大化状态变化
+	Height float64 `json:"height"`
+	// Left 指定标题栏左侧系统窗口按钮的保留宽度
+	Left float64 `json:"left"`
+	// Right 指定标题栏右侧系统窗口按钮的保留宽度
+	Right float64 `json:"right"`
+	// Active 表示窗口处于激活状态
+	Active bool `json:"active"`
+	// Maximized 表示窗口已经最大化
+	Maximized bool `json:"maximized"`
+	// Colors 提供与系统按钮区域共用的内容标题栏配色，零值使用系统外观
+	Colors TitleBarColors `json:"colors"`
+}
+
 // Options 定义窗口、资源和生命周期配置，客户区尺寸单位为逻辑像素
 type Options struct {
 	// AppID 指定稳定的应用标识，长度不超过128字节，以小写字母开头，不以点结尾
@@ -58,6 +110,10 @@ type Options struct {
 	AppID string
 	// Title 指定窗口标题
 	Title string
+	// TitleBar 指定标题栏模式，零值使用系统标题栏
+	TitleBar TitleBarMode
+	// TitleBarColors 指定内容标题栏配色，零值保留系统外观，非零值需完整提供四种颜色
+	TitleBarColors TitleBarColors
 	// Icon 指定正方形PNG窗口图标数据，边长不超过2048像素，数据不超过16MiB，与IconPath互斥
 	Icon []byte
 	// IconPath 指定外置PNG图标路径，格式及尺寸限制与Icon一致，两者互斥
@@ -98,6 +154,9 @@ type Options struct {
 	Bindings map[string]HandlerFunc
 	// OnReady 在宿主就绪且首次导航前调用，回调返回后才加载页面
 	OnReady func(*Window)
+	// OnTitleBarChanged 在OnReady返回后于后台串行接收初始布局及布局、激活、最大化或DPI变化，可调用Window方法
+	// 快速变化可合并为最新状态，回调不应阻塞，关闭时未交付的通知可丢弃
+	OnTitleBarChanged func(TitleBarInfo)
 	// OnClosing 返回是否允许用户关闭窗口，上下文取消时直接关闭
 	OnClosing func(context.Context) bool
 	// OnClose 在窗口退出后调用，回调结束后Run返回
@@ -258,6 +317,38 @@ func (w *Window) SetTitle(title string) error {
 		return errors.New("title contains NUL")
 	}
 	return w.native.setTitle(title)
+}
+
+// TitleBarInfo 返回当前标题栏布局和窗口状态
+// 返回: TitleBarInfo 标题栏信息, error 查询错误
+func (w *Window) TitleBarInfo() (TitleBarInfo, error) {
+	if w == nil || w.native == nil {
+		return TitleBarInfo{}, ErrClosed
+	}
+	return w.native.titleBarInfo()
+}
+
+// SetDragRegions 替换内容标题栏的原生拖动区域，空切片清除区域，系统模式返回错误
+// 区域使用客户区逻辑像素，不随页面缩放变化，调用方负责排除交互控件并随布局更新
+// 超出客户区的部分裁剪，系统按钮及调整大小的边缘优先，不改变页面内容或注入JS接口
+// 入参: regions 拖动矩形集合，调用时复制，坐标和尺寸必须有限且尺寸非负
+// 返回: error 设置错误
+func (w *Window) SetDragRegions(regions []Rect) error {
+	if w == nil || w.native == nil {
+		return ErrClosed
+	}
+	regions = append([]Rect(nil), regions...)
+	for _, r := range regions {
+		for _, v := range []float64{r.X, r.Y, r.Width, r.Height, r.X + r.Width, r.Y + r.Height} {
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				return errors.New("drag region must be finite")
+			}
+		}
+		if r.Width < 0 || r.Height < 0 {
+			return errors.New("invalid drag region dimensions")
+		}
+	}
+	return w.native.setDragRegions(regions)
 }
 
 // SetSize 修改客户区尺寸并遵循约束
@@ -431,6 +522,22 @@ func validateAppID(appID string) error {
 // 入参: o 宿主选项
 // 返回: error 校验错误
 func validate(o *Options) error {
+	if o.TitleBar != TitleBarSystem && o.TitleBar != TitleBarContent {
+		return errors.New("invalid title bar mode")
+	}
+	if o.TitleBarColors != (TitleBarColors{}) {
+		if o.TitleBar != TitleBarContent {
+			return errors.New("title bar colors require content title bar")
+		}
+		for _, value := range []string{o.TitleBarColors.Background, o.TitleBarColors.Foreground, o.TitleBarColors.InactiveBackground, o.TitleBarColors.InactiveForeground} {
+			if len(value) != 7 || value[0] != '#' {
+				return errors.New("title bar color must use #RRGGBB")
+			}
+			if _, err := hex.DecodeString(value[1:]); err != nil {
+				return errors.New("title bar color must use #RRGGBB")
+			}
+		}
+	}
 	if o.AppID != "" {
 		if err := validateAppID(o.AppID); err != nil {
 			return err

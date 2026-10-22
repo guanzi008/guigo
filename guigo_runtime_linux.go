@@ -49,8 +49,14 @@ type nativeValue struct {
 	Data [2]uintptr
 }
 
+// linuxRectangle 对应GTK分配区域的原生布局
+type linuxRectangle struct {
+	X, Y, Width, Height int32
+}
+
 // linuxAPI 保存动态加载的原生入口
 type linuxAPI struct {
+	ScaleFactor      func(uintptr) int32                                                       `symbol:"gtk_widget_get_scale_factor"`
 	RequestView      func(uintptr) uintptr                                                     `symbol:"webkit_uri_scheme_request_get_web_view"`
 	Prgname          func(string)                                                              `symbol:"g_set_prgname"`
 	ValueInit        func(*nativeValue, uintptr) *nativeValue                                  `symbol:"g_value_init"`
@@ -70,6 +76,26 @@ type linuxAPI struct {
 	Minimum          func(uintptr, int32, int32)                                               `symbol:"gtk_widget_set_size_request"`
 	Resizable        func(uintptr, bool)                                                       `symbol:"gtk_window_set_resizable"`
 	Child            func(uintptr, uintptr)                                                    `symbol:"gtk_window_set_child"`
+	Titlebar         func(uintptr, uintptr)                                                    `symbol:"gtk_window_set_titlebar"`
+	BoxNew           func(int32, int32) uintptr                                                `symbol:"gtk_box_new"`
+	Visible          func(uintptr, bool)                                                       `symbol:"gtk_widget_set_visible"`
+	OverlayNew       func() uintptr                                                            `symbol:"gtk_overlay_new"`
+	OverlayChild     func(uintptr, uintptr)                                                    `symbol:"gtk_overlay_set_child"`
+	OverlayAdd       func(uintptr, uintptr)                                                    `symbol:"gtk_overlay_add_overlay"`
+	OverlayRemove    func(uintptr, uintptr)                                                    `symbol:"gtk_overlay_remove_overlay"`
+	WindowControls   func(int32) uintptr                                                       `symbol:"gtk_window_controls_new"`
+	ControlsEmpty    func(uintptr) bool                                                        `symbol:"gtk_window_controls_get_empty"`
+	CSSProviderNew   func() uintptr                                                            `symbol:"gtk_css_provider_new"`
+	CSSLoad          func(uintptr, string, int64)                                              `symbol:"gtk_css_provider_load_from_data"`
+	CSSAdd           func(uintptr, uintptr, uint32)                                            `symbol:"gtk_style_context_add_provider_for_display"`
+	CSSRemove        func(uintptr, uintptr)                                                    `symbol:"gtk_style_context_remove_provider_for_display"`
+	CSSClass         func(uintptr, string)                                                     `symbol:"gtk_widget_add_css_class"`
+	WindowHandle     func() uintptr                                                            `symbol:"gtk_window_handle_new"`
+	WidgetWidth      func(uintptr) int32                                                       `symbol:"gtk_widget_get_width"`
+	WidgetHeight     func(uintptr) int32                                                       `symbol:"gtk_widget_get_height"`
+	Measure          func(uintptr, int32, int32, *int32, *int32, *int32, *int32)               `symbol:"gtk_widget_measure"`
+	IsActive         func(uintptr) bool                                                        `symbol:"gtk_window_is_active"`
+	IsMaximized      func(uintptr) bool                                                        `symbol:"gtk_window_is_maximized"`
 	Present          func(uintptr)                                                             `symbol:"gtk_window_present"`
 	Maximize         func(uintptr)                                                             `symbol:"gtk_window_maximize"`
 	Destroy          func(uintptr)                                                             `symbol:"gtk_window_destroy"`

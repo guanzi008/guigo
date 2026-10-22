@@ -62,6 +62,19 @@ func (n *nativeWindow) setTitle(title string) error {
 	return ErrUnsupportedPlatform
 }
 
+// titleBarInfo 返回平台不支持错误
+// 返回: TitleBarInfo 空标题栏信息, error 平台错误
+func (n *nativeWindow) titleBarInfo() (TitleBarInfo, error) {
+	return TitleBarInfo{}, ErrUnsupportedPlatform
+}
+
+// setDragRegions 返回平台不支持错误
+// 入参: regions 拖动矩形集合
+// 返回: error 平台错误
+func (n *nativeWindow) setDragRegions(regions []Rect) error {
+	return ErrUnsupportedPlatform
+}
+
 // setSize 返回平台不支持错误
 // 入参: w 客户区宽度, h 客户区高度
 // 返回: error 平台错误

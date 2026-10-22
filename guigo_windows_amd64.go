@@ -112,35 +112,46 @@ type comObject struct {
 
 // nativeWindow 保存STA线程拥有的原生对象
 type nativeWindow struct {
-	options       Options
-	mu            sync.Mutex
-	ctx           context.Context
-	cancel        context.CancelFunc
-	done          chan struct{}
-	queue         []queuedCall
-	topQueue      []func()
-	hwnd          uintptr
-	dpi           uint32
-	iconData      []byte
-	icons         [2]uintptr
-	environment   *comObject
-	controller    *comObject
-	webview       *comObject
-	activeDialog  *comObject
-	callbacks     []*comCallback
-	generation    uint64
-	pageCtx       context.Context
-	pageCancel    context.CancelFunc
-	calls         *callQueue
-	pendingEvents []string
-	resources     map[*comObject]resourceRequest
-	temporary     temporaryDirectory
-	initializing  bool
-	ready         bool
-	shown         bool
-	closing       bool
-	closed        bool
-	err           error
+	options         Options
+	mu              sync.Mutex
+	ctx             context.Context
+	cancel          context.CancelFunc
+	done            chan struct{}
+	queue           []queuedCall
+	topQueue        []func()
+	hwnd            uintptr
+	contentWindow   uintptr
+	dragWindow      uintptr
+	dragRegions     []Rect
+	titleBarState   TitleBarInfo
+	titleBarDPI     uint32
+	titleBarEvents  chan TitleBarInfo
+	titleBarReady   bool
+	titleBarPending bool
+	titleBarLayout  bool
+	dpi             uint32
+	iconData        []byte
+	icons           [2]uintptr
+	environment     *comObject
+	controller      *comObject
+	webview         *comObject
+	activeDialog    *comObject
+	callbacks       []*comCallback
+	generation      uint64
+	pageCtx         context.Context
+	pageCancel      context.CancelFunc
+	calls           *callQueue
+	pendingEvents   []string
+	resources       map[*comObject]resourceRequest
+	temporary       temporaryDirectory
+	initializing    bool
+	ready           bool
+	shown           bool
+	closing         bool
+	closePending    bool
+	closeRequested  bool
+	closed          bool
+	err             error
 }
 
 // queuedCall 保存主线程操作及关闭时的资源回收操作
@@ -315,6 +326,10 @@ func run(parent context.Context, o Options) error {
 	n.ctx, n.cancel = context.WithCancel(parent)
 	defer n.temporary.close()
 	defer n.cancel()
+	if o.OnTitleBarChanged != nil {
+		n.titleBarEvents = make(chan TitleBarInfo, 1)
+		go n.deliverTitleBarChanges()
+	}
 	hr, _, _ := ole32.NewProc("CoInitializeEx").Call(0, 2)
 	if err := hresult(hr); err != nil {
 		return err
@@ -358,7 +373,10 @@ func run(parent context.Context, o Options) error {
 	defer func() { destroyIcons(n.icons) }()
 	instance, _, _ := kernel32.NewProc("GetModuleHandleW").Call(0)
 	cursor, _, _ := user32.NewProc("LoadCursorW").Call(0, 32512)
-	class := windowClass{Proc: wndCallback, Instance: instance, Cursor: cursor, Name: wide("GUIGo.Native.Window")}
+	class := windowClass{Style: 8, Proc: wndCallback, Instance: instance, Cursor: cursor, Name: wide("GUIGo.Native.Window")}
+	if o.TitleBar == TitleBarContent {
+		class.Background, _, _ = gdi32.NewProc("GetStockObject").Call(4)
+	}
 	class.Size = uint32(unsafe.Sizeof(class))
 	atom, _, e := user32.NewProc("RegisterClassExW").Call(uintptr(unsafe.Pointer(&class)))
 	if atom == 0 && e != syscall.Errno(1410) {
@@ -408,6 +426,7 @@ func run(parent context.Context, o Options) error {
 		n.controller = nil
 		n.environment = nil
 		user32.NewProc("DestroyWindow").Call(n.hwnd)
+		n.unregisterTitleBar()
 		if browser != 0 {
 			waitBrowserExit(browser)
 			kernel32.NewProc("CloseHandle").Call(browser)
@@ -417,6 +436,9 @@ func run(parent context.Context, o Options) error {
 		}
 	}()
 	if err := n.initializeDPI(); err != nil {
+		return err
+	}
+	if err := n.initializeTitleBar(); err != nil {
 		return err
 	}
 	if err := n.updateIcons(); err != nil {
@@ -465,7 +487,11 @@ func run(parent context.Context, o Options) error {
 			}
 			return 0
 		})
-		if err := hresult(com(env, 3, n.hwnd, cb)); err != nil {
+		parent := n.hwnd
+		if n.contentWindow != 0 {
+			parent = n.contentWindow
+		}
+		if err := hresult(com(env, 3, parent, cb)); err != nil {
 			n.fail(err)
 		}
 		return 0
@@ -748,11 +774,17 @@ func (n *nativeWindow) setClientSize(w, h int) error {
 
 // resize 更新WebView客户区
 func (n *nativeWindow) resize() {
+	if n.contentWindow != 0 {
+		if err := n.layoutTitleBar(); err != nil {
+			n.fail(err)
+		}
+	}
 	if n.controller != nil {
 		var r rect
 		user32.NewProc("GetClientRect").Call(n.hwnd, uintptr(unsafe.Pointer(&r)))
 		com(n.controller, 6, uintptr(unsafe.Pointer(&r)))
 	}
+	n.scheduleTitleBarChange()
 }
 
 // windowProc 处理Win32消息
@@ -761,6 +793,9 @@ func (n *nativeWindow) resize() {
 func windowProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 	n := active.Load()
 	if n != nil {
+		if result, handled := n.titleBarProc(hwnd, msg, wparam, lparam); handled {
+			return result
+		}
 		switch msg {
 		case 0x8001:
 			n.mu.Lock()
@@ -778,6 +813,8 @@ func windowProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 			if n.controller != nil {
 				com(n.controller, 23)
 			}
+		case 6:
+			n.scheduleTitleBarChange()
 		case 0x10:
 			n.requestClose()
 			return 0
@@ -788,6 +825,7 @@ func windowProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 			if err := n.updateIcons(); err != nil && n.options.OnError != nil {
 				go n.options.OnError(err)
 			}
+			n.resize()
 			return 0
 		case 0x24:
 			info := *(**[5]point)(unsafe.Pointer(&lparam))
@@ -969,6 +1007,11 @@ func (n *nativeWindow) setup() error {
 				n.options.OnReady(&Window{native: n})
 			}
 			_ = n.enqueue(func() {
+				if n.closeRequested {
+					return
+				}
+				n.titleBarReady = true
+				n.publishTitleBarChange(true)
 				if err := hresult(com(n.webview, 5, uintptr(unsafe.Pointer(wide(resourceURL(n.options.EntryPath)))))); err != nil {
 					n.fail(err)
 				}
@@ -985,7 +1028,7 @@ func (n *nativeWindow) setup() error {
 		com(args, 3, uintptr(unsafe.Pointer(&success)))
 		if success == 0 {
 			var status int32
-			if hresult(com(args, 4, uintptr(unsafe.Pointer(&status)))) == nil && status == 14 {
+			if hresult(com(args, 4, uintptr(unsafe.Pointer(&status)))) == nil && (status == 14 || status == 9 && n.closeRequested) {
 				return 0
 			}
 			n.fail(errors.New("navigation failed"))
@@ -1049,7 +1092,7 @@ func (n *nativeWindow) pixels(value int) int32 {
 	return int32((int64(value)*int64(n.dpi) + 48) / 96)
 }
 
-// requestClose 异步检查宿主关闭条件并触发浏览器beforeunload
+// requestClose 异步检查宿主关闭条件，保留校验期间的新请求并触发浏览器beforeunload
 func (n *nativeWindow) requestClose() {
 	if n.initializing {
 		n.cancel()
@@ -1063,6 +1106,10 @@ func (n *nativeWindow) requestClose() {
 		return
 	}
 	if n.closing {
+		n.closePending = true
+		return
+	}
+	if n.closeRequested {
 		return
 	}
 	n.closing = true
@@ -1080,16 +1127,24 @@ func (n *nativeWindow) requestClose() {
 		}
 		_ = n.enqueue(func() {
 			n.closing = false
+			pending := n.closePending
+			n.closePending = false
 			if !allowed {
+				if pending {
+					n.requestClose()
+				}
 				return
 			}
 			callback := n.callback("{5C4889F0-5EF6-4C5A-952C-D8F1B92D0574}", func(hr uintptr, _ *comObject) uintptr {
+				n.closeRequested = false
 				if err := hresult(hr); err != nil {
 					n.err = err
 				}
 				return 0
 			})
+			n.closeRequested = true
 			if err := hresult(com(n.webview, 36, uintptr(unsafe.Pointer(wide("Page.close"))), uintptr(unsafe.Pointer(wide("{}"))), callback)); err != nil {
+				n.closeRequested = false
 				n.err = err
 			}
 		})
@@ -1100,6 +1155,7 @@ func (n *nativeWindow) requestClose() {
 // 入参: r 客户区矩形，返回窗口矩形
 // 返回: error 计算错误
 func (n *nativeWindow) adjustRect(r *rect) error {
+	top := r.Top
 	proc := user32.NewProc("AdjustWindowRectExForDpi")
 	if err := proc.Find(); err != nil {
 		return err
@@ -1107,6 +1163,9 @@ func (n *nativeWindow) adjustRect(r *rect) error {
 	ok, _, err := proc.Call(uintptr(unsafe.Pointer(r)), n.style(), 0, 0, uintptr(n.dpi))
 	if ok == 0 {
 		return err
+	}
+	if n.options.TitleBar == TitleBarContent {
+		r.Top = top
 	}
 	return nil
 }
