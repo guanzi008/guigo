@@ -89,7 +89,7 @@ type Rect struct {
 
 // TitleBarInfo 保存逻辑像素标题栏布局和窗口状态
 type TitleBarInfo struct {
-	// Height 指定内容标题栏实际高度，系统模式为零，不保证最小高度，随DPI及最大化状态变化
+	// Height 指定内容标题栏实际高度，系统模式为零，同一DPI下不随最大化状态变化
 	Height float64 `json:"height"`
 	// Left 指定标题栏左侧系统窗口按钮的保留宽度
 	Left float64 `json:"left"`

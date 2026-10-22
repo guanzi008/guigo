@@ -84,11 +84,7 @@ func (n *nativeWindow) titleBarBorder() int32 {
 func (n *nativeWindow) titleBarBounds() (int32, rect) {
 	var client, window, buttons rect
 	user32.NewProc("GetClientRect").Call(n.hwnd, uintptr(unsafe.Pointer(&client)))
-	height := n.titleBarMetric(4)
-	zoomed, _, _ := user32.NewProc("IsZoomed").Call(n.hwnd)
-	if zoomed == 0 {
-		height += n.titleBarBorder()
-	}
+	height := n.titleBarMetric(4) + n.titleBarBorder()
 	width := 3 * max(n.pixels(46), n.titleBarMetric(30))
 	origin := point{}
 	user32.NewProc("ClientToScreen").Call(n.hwnd, uintptr(unsafe.Pointer(&origin)))
