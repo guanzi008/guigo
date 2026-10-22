@@ -312,16 +312,14 @@ func (n *nativeWindow) layoutTitleBar() error {
 	if err != nil {
 		return err
 	}
-	for _, r := range []rect{buttons, top} {
-		if err := combineTitleBarRegion(content, r, 4); err != nil {
-			gdi32.NewProc("DeleteObject").Call(content)
-			return err
-		}
+	if err := combineTitleBarRegion(content, buttons, 4); err != nil {
+		gdi32.NewProc("DeleteObject").Call(content)
+		return err
 	}
 	if err := applyTitleBarRegion(n.contentWindow, content); err != nil {
 		return err
 	}
-	drag, err := titleBarRegion(rect{})
+	drag, err := titleBarRegion(top)
 	if err != nil {
 		return err
 	}
@@ -331,11 +329,9 @@ func (n *nativeWindow) layoutTitleBar() error {
 			return err
 		}
 	}
-	for _, r := range []rect{buttons, top} {
-		if err := combineTitleBarRegion(drag, r, 4); err != nil {
-			gdi32.NewProc("DeleteObject").Call(drag)
-			return err
-		}
+	if err := combineTitleBarRegion(drag, buttons, 4); err != nil {
+		gdi32.NewProc("DeleteObject").Call(drag)
+		return err
 	}
 	return applyTitleBarRegion(n.dragWindow, drag)
 }
@@ -348,7 +344,8 @@ func titleBarChildProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 	if n != nil && hwnd == n.dragWindow {
 		switch {
 		case msg == 0x84:
-			return 2
+			result, _, _ := user32.NewProc("SendMessageW").Call(n.hwnd, msg, wparam, lparam)
+			return result
 		case msg >= 0xa0 && msg <= 0xad || msg == 0x7b:
 			result, _, _ := user32.NewProc("SendMessageW").Call(n.hwnd, msg, wparam, lparam)
 			return result
