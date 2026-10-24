@@ -136,6 +136,7 @@ type nativeWindow struct {
 	controller      *comObject
 	webview         *comObject
 	activeDialog    *comObject
+	printActive     bool
 	callbacks       []*comCallback
 	generation      uint64
 	pageCtx         context.Context

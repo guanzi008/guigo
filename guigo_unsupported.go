@@ -21,6 +21,48 @@ import "context"
 // nativeWindow 提供未适配平台的宿主占位类型
 type nativeWindow struct{}
 
+// listPrinters 返回未适配平台的设备查询错误
+// 入参: ctx 查询上下文
+// 返回: []PrinterInfo 空队列, error 平台错误
+func (n *nativeWindow) listPrinters(ctx context.Context) ([]PrinterInfo, error) {
+	return nil, ErrUnsupportedPlatform
+}
+
+// queryPrinter 返回未适配平台的设备查询错误
+// 入参: ctx 查询上下文, o 设备打印选项
+// 返回: PrinterProfile 空设备信息, error 平台错误
+func (n *nativeWindow) queryPrinter(ctx context.Context, o PrintOptions) (PrinterProfile, error) {
+	return PrinterProfile{}, ErrUnsupportedPlatform
+}
+
+// showPrinterProperties 返回未适配平台的设备属性错误
+// 入参: ctx 调用上下文, name 系统队列名称
+// 返回: error 平台错误
+func (n *nativeWindow) showPrinterProperties(ctx context.Context, name string) error {
+	return ErrUnsupportedPlatform
+}
+
+// printCapabilities 返回未适配平台的打印错误
+// 入参: ctx 查询上下文
+// 返回: PrintCapabilities 空能力信息, error 平台错误
+func (n *nativeWindow) printCapabilities(ctx context.Context) (PrintCapabilities, error) {
+	return PrintCapabilities{}, ErrUnsupportedPlatform
+}
+
+// showPrintUI 返回未适配平台的打印错误
+// 入参: ctx 调用上下文, kind 打印窗口类型
+// 返回: error 平台错误
+func (n *nativeWindow) showPrintUI(ctx context.Context, kind string) error {
+	return ErrUnsupportedPlatform
+}
+
+// print 返回未适配平台的打印错误
+// 入参: ctx 调用上下文, o 设备打印选项
+// 返回: PrintResult 空提交结果, error 平台错误
+func (n *nativeWindow) print(ctx context.Context, o PrintOptions) (PrintResult, error) {
+	return PrintResult{}, ErrUnsupportedPlatform
+}
+
 // resourceURL 返回未适配平台的空资源地址
 // 入参: path 资源路径
 // 返回: string 空地址

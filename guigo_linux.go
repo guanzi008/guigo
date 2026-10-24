@@ -634,6 +634,12 @@ func (n *nativeWindow) shutdown() {
 		}
 	}
 	if first {
+		linuxPrintOperations.Range(func(key, value any) bool {
+			if value.(*linuxPrintOperation).owner == n {
+				linuxEndPrint(key.(uintptr), ErrClosed)
+			}
+			return true
+		})
 		n.cancel()
 		n.pageCancel()
 		close(n.done)

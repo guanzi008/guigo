@@ -56,6 +56,24 @@ type linuxRectangle struct {
 
 // linuxAPI 保存动态加载的原生入口
 type linuxAPI struct {
+	PrintNew         func(uintptr) uintptr                                                     `symbol:"webkit_print_operation_new"`
+	PrintDialog      func(uintptr, uintptr) int32                                              `symbol:"webkit_print_operation_run_dialog"`
+	PrintRun         func(uintptr)                                                             `symbol:"webkit_print_operation_print"`
+	PrintSettings    func(uintptr, uintptr)                                                    `symbol:"webkit_print_operation_set_print_settings"`
+	PrintPageSetup   func(uintptr, uintptr)                                                    `symbol:"webkit_print_operation_set_page_setup"`
+	PrintSettingsNew func() uintptr                                                            `symbol:"gtk_print_settings_new"`
+	PrintSet         func(uintptr, string, string)                                             `symbol:"gtk_print_settings_set"`
+	PrintRanges      func(uintptr, unsafe.Pointer, int32)                                      `symbol:"gtk_print_settings_set_page_ranges"`
+	PageSetupNew     func() uintptr                                                            `symbol:"gtk_page_setup_new"`
+	PaperNew         func(string, string, float64, float64, int32) uintptr                     `symbol:"gtk_paper_size_new_custom"`
+	PaperFree        func(uintptr)                                                             `symbol:"gtk_paper_size_free"`
+	PagePaper        func(uintptr, uintptr)                                                    `symbol:"gtk_page_setup_set_paper_size"`
+	PageOrientation  func(uintptr, int32)                                                      `symbol:"gtk_page_setup_set_orientation"`
+	PageTop          func(uintptr, float64, int32)                                             `symbol:"gtk_page_setup_set_top_margin"`
+	PageBottom       func(uintptr, float64, int32)                                             `symbol:"gtk_page_setup_set_bottom_margin"`
+	PageLeft         func(uintptr, float64, int32)                                             `symbol:"gtk_page_setup_set_left_margin"`
+	PageRight        func(uintptr, float64, int32)                                             `symbol:"gtk_page_setup_set_right_margin"`
+	SignalDisconnect func(uintptr, uint64)                                                     `symbol:"g_signal_handler_disconnect"`
 	ScaleFactor      func(uintptr) int32                                                       `symbol:"gtk_widget_get_scale_factor"`
 	RequestView      func(uintptr) uintptr                                                     `symbol:"webkit_uri_scheme_request_get_web_view"`
 	Prgname          func(string)                                                              `symbol:"g_set_prgname"`
