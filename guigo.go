@@ -307,6 +307,15 @@ func (w *Window) Close() error {
 	return w.native.close()
 }
 
+// Activate 请求恢复并显示窗口，是否获得焦点由桌面系统决定
+// 返回: error 请求投递错误
+func (w *Window) Activate() error {
+	if w == nil || w.native == nil {
+		return ErrClosed
+	}
+	return w.native.activate()
+}
+
 // SetTitle 修改窗口标题
 // 入参: title 窗口标题
 // 返回: error 错误信息

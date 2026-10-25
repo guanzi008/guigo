@@ -539,6 +539,20 @@ func run(parent context.Context, o Options) error {
 	return parent.Err()
 }
 
+// activate 恢复最小化窗口并请求前台激活
+// 返回: error 请求投递错误
+func (n *nativeWindow) activate() error {
+	return n.enqueue(func() {
+		iconic, _, _ := user32.NewProc("IsIconic").Call(n.hwnd)
+		if iconic != 0 {
+			user32.NewProc("ShowWindow").Call(n.hwnd, 9)
+		} else if n.shown {
+			user32.NewProc("ShowWindow").Call(n.hwnd, 5)
+		}
+		user32.NewProc("SetForegroundWindow").Call(n.hwnd)
+	})
+}
+
 // setAppID 设置窗口应用标识，空字符串移除窗口属性
 // 入参: appID 应用标识
 // 返回: error 设置错误

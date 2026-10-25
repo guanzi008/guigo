@@ -21,6 +21,12 @@ import "context"
 // nativeWindow 提供未适配平台的宿主占位类型
 type nativeWindow struct{}
 
+// activate 返回未适配平台错误
+// 返回: error 平台错误
+func (n *nativeWindow) activate() error {
+	return ErrUnsupportedPlatform
+}
+
 // listPrinters 返回未适配平台的设备查询错误
 // 入参: ctx 查询上下文
 // 返回: []PrinterInfo 空队列, error 平台错误

@@ -558,6 +558,12 @@ func linuxMessage(manager, value, data uintptr) {
 	}
 }
 
+// activate 请求桌面显示已有窗口
+// 返回: error 请求投递错误
+func (n *nativeWindow) activate() error {
+	return n.enqueue(func() { gtk.Present(n.window) })
+}
+
 // close 请求执行窗口关闭检查
 // 返回: error 关闭错误
 func (n *nativeWindow) close() error {
