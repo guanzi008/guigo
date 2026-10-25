@@ -76,7 +76,8 @@ type linuxAPI struct {
 	SignalDisconnect func(uintptr, uint64)                                                     `symbol:"g_signal_handler_disconnect"`
 	ScaleFactor      func(uintptr) int32                                                       `symbol:"gtk_widget_get_scale_factor"`
 	RequestView      func(uintptr) uintptr                                                     `symbol:"webkit_uri_scheme_request_get_web_view"`
-	Prgname          func(string)                                                              `symbol:"g_set_prgname"`
+	Prgname          func(*byte)                                                               `symbol:"g_set_prgname"`
+	GetPrgname       func() *byte                                                              `symbol:"g_get_prgname"`
 	ValueInit        func(*nativeValue, uintptr) *nativeValue                                  `symbol:"g_value_init"`
 	ValueObject      func(*nativeValue, uintptr)                                               `symbol:"g_value_set_object"`
 	ValueUnset       func(*nativeValue)                                                        `symbol:"g_value_unset"`

@@ -160,7 +160,9 @@ func runLinux(parent context.Context, o Options) error {
 		return err
 	}
 	if o.AppID != "" {
-		gtk.Prgname(o.AppID)
+		defer gtk.Prgname(gtk.GetPrgname())
+		name := append([]byte(o.AppID), 0)
+		gtk.Prgname(&name[0])
 	}
 	if !gtk.Init() {
 		return errors.New("GTK could not open display")
