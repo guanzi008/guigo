@@ -116,6 +116,7 @@ type linuxAPI struct {
 	IsActive         func(uintptr) bool                                                        `symbol:"gtk_window_is_active"`
 	IsMaximized      func(uintptr) bool                                                        `symbol:"gtk_window_is_maximized"`
 	Present          func(uintptr)                                                             `symbol:"gtk_window_present"`
+	Unminimize       func(uintptr)                                                             `symbol:"gtk_window_unminimize"`
 	Maximize         func(uintptr)                                                             `symbol:"gtk_window_maximize"`
 	Destroy          func(uintptr)                                                             `symbol:"gtk_window_destroy"`
 	IconName         func(uintptr, string)                                                     `symbol:"gtk_window_set_icon_name"`

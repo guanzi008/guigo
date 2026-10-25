@@ -308,6 +308,7 @@ func (w *Window) Close() error {
 }
 
 // Activate 请求恢复并显示窗口，是否获得焦点由桌面系统决定
+// 首屏加载完成前调用时，窗口仍按正常启动流程显示
 // 返回: error 请求投递错误
 func (w *Window) Activate() error {
 	if w == nil || w.native == nil {

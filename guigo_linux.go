@@ -558,10 +558,16 @@ func linuxMessage(manager, value, data uintptr) {
 	}
 }
 
-// activate 请求桌面显示已有窗口
+// activate 首次显示后请求桌面恢复最小化窗口并激活
 // 返回: error 请求投递错误
 func (n *nativeWindow) activate() error {
-	return n.enqueue(func() { gtk.Present(n.window) })
+	return n.enqueue(func() {
+		if !n.shown {
+			return
+		}
+		gtk.Unminimize(n.window)
+		gtk.Present(n.window)
+	})
 }
 
 // close 请求执行窗口关闭检查
