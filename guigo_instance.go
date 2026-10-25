@@ -28,6 +28,9 @@ import (
 // instanceLimit 限制单次实例消息的字节数
 const instanceLimit = 1 << 20
 
+// errInstanceWindow 表示窗口已不属于当前桌面，需要重新选择接收端
+var errInstanceWindow = errors.New("instance window is not on current desktop")
+
 // instanceConn 提供支持截止时间的本机通信连接
 type instanceConn interface {
 	io.ReadWriteCloser
@@ -76,10 +79,7 @@ func OpenInstance(ctx context.Context, key string, data []byte, receive func(con
 			return nil, err
 		}
 		if listener != nil {
-			life, stop := context.WithCancel(ctx)
-			instance := &Instance{listener: listener, cancel: stop, done: make(chan struct{})}
-			go instance.serve(life, receive)
-			return instance, nil
+			return startInstance(ctx, listener, receive), nil
 		}
 		conn, err := dialInstance(request, address)
 		if err == nil {
@@ -96,6 +96,29 @@ func OpenInstance(ctx context.Context, key string, data []byte, receive func(con
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
+}
+
+// OpenWindowInstance 优先转交到当前虚拟桌面最近激活的同组窗口，没有时创建入口
+// Windows按窗口实时所属桌面选择，其他平台沿用OpenInstance的复用范围
+// 返回入口后应传入Options.Instance启动窗口，并在运行结束后关闭入口
+// 窗口登记前同组启动会等待；消息接收及用户隔离约定与OpenInstance相同
+// 入参: ctx 生命周期上下文, key 调用方实例键, data 转交消息, receive 接收回调
+// 返回: *Instance 新窗口入口或nil, error 创建或转交错误
+func OpenWindowInstance(ctx context.Context, key string, data []byte, receive func(context.Context, []byte) error) (*Instance, error) {
+	if ctx == nil || key == "" || receive == nil || len(data) > instanceLimit {
+		return nil, errors.New("invalid instance options")
+	}
+	return openWindowInstance(ctx, key, data, receive)
+}
+
+// startInstance 启动入口接收循环
+// 入参: ctx 生命周期上下文, listener 接收端, receive 接收回调
+// 返回: *Instance 实例入口
+func startInstance(ctx context.Context, listener instanceListener, receive func(context.Context, []byte) error) *Instance {
+	life, stop := context.WithCancel(ctx)
+	instance := &Instance{listener: listener, cancel: stop, done: make(chan struct{})}
+	go instance.serve(life, receive)
+	return instance
 }
 
 // forwardInstance 转交消息并读取接收结果，不重发已确认或结果不明的请求
@@ -137,6 +160,8 @@ func forwardInstance(ctx context.Context, conn instanceConn, data []byte) error 
 		return errors.New(string(reply[1:]))
 	case 2:
 		return ErrClosed
+	case 3:
+		return errInstanceWindow
 	default:
 		return errors.New("invalid instance reply")
 	}
@@ -192,6 +217,8 @@ func (i *Instance) receive(ctx context.Context, conn instanceConn, receive func(
 	if err := receive(request, data); err != nil {
 		if errors.Is(err, ErrClosed) {
 			reply[0] = 2
+		} else if errors.Is(err, errInstanceWindow) {
+			reply[0] = 3
 		} else {
 			reply = append([]byte{1}, []byte(err.Error())...)
 		}

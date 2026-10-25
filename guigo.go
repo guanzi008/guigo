@@ -105,6 +105,8 @@ type TitleBarInfo struct {
 
 // Options 定义窗口、资源和生命周期配置，客户区尺寸单位为逻辑像素
 type Options struct {
+	// Instance 指定OpenWindowInstance返回的入口，创建窗口时自动登记，调用方负责关闭入口
+	Instance *Instance
 	// AppID 指定稳定的应用标识，长度不超过128字节，以英文字母开头，不以点结尾
 	// 允许英文字母、数字、点和连字符，保留大小写，不随程序版本或位置变化
 	// Windows用于窗口身份，Linux用于程序名称

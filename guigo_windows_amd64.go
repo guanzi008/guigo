@@ -444,6 +444,14 @@ func run(parent context.Context, o Options) error {
 			return err
 		}
 	}
+	if o.Instance != nil {
+		if entry, ok := o.Instance.listener.(*windowInstance); ok {
+			if err := entry.attachWindow(n); err != nil {
+				return err
+			}
+			defer entry.Close()
+		}
+	}
 	if err := n.initializeDPI(); err != nil {
 		return err
 	}
@@ -865,6 +873,9 @@ func windowProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 				com(n.controller, 23)
 			}
 		case 6:
+			if wparam&0xffff != 0 && n.options.Instance != nil {
+				recordInstanceActivation(hwnd)
+			}
 			n.scheduleTitleBarChange()
 		case 0x10:
 			n.requestClose()
