@@ -426,6 +426,9 @@ func run(parent context.Context, o Options) error {
 		n.webview = nil
 		n.controller = nil
 		n.environment = nil
+		if o.AppID != "" {
+			_ = n.setAppID("")
+		}
 		user32.NewProc("DestroyWindow").Call(n.hwnd)
 		n.unregisterTitleBar()
 		if browser != 0 {
@@ -436,6 +439,11 @@ func run(parent context.Context, o Options) error {
 			callbackRelease(c)
 		}
 	}()
+	if o.AppID != "" {
+		if err := n.setAppID(o.AppID); err != nil {
+			return err
+		}
+	}
 	if err := n.initializeDPI(); err != nil {
 		return err
 	}
@@ -529,6 +537,34 @@ func run(parent context.Context, o Options) error {
 		return n.err
 	}
 	return parent.Err()
+}
+
+// setAppID 设置窗口应用标识，空字符串移除窗口属性
+// 入参: appID 应用标识
+// 返回: error 设置错误
+func (n *nativeWindow) setAppID(appID string) error {
+	iid := guid("{886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99}")
+	var store *comObject
+	hr, _, _ := shell32.NewProc("SHGetPropertyStoreForWindow").Call(n.hwnd, uintptr(unsafe.Pointer(&iid)), uintptr(unsafe.Pointer(&store)))
+	if err := hresult(hr); err != nil {
+		return err
+	}
+	defer release(store)
+	key := struct {
+		Format syscall.GUID
+		ID     uint32
+	}{guid("{9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}"), 5}
+	value := struct {
+		Type     uint16
+		Reserved [3]uint16
+		Text     *uint16
+		Padding  uintptr
+	}{}
+	if appID != "" {
+		value.Type = 31
+		value.Text = wide(appID)
+	}
+	return hresult(com(store, 6, uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&value))))
 }
 
 // drainTop 仅在最外层消息循环运行模态操作，避免重入WebView2回调

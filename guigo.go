@@ -105,8 +105,9 @@ type TitleBarInfo struct {
 
 // Options 定义窗口、资源和生命周期配置，客户区尺寸单位为逻辑像素
 type Options struct {
-	// AppID 指定稳定的应用标识，长度不超过128字节，以小写字母开头，不以点结尾
-	// 允许小写字母、数字、点和连字符，不随程序版本或位置变化
+	// AppID 指定稳定的应用标识，长度不超过128字节，以英文字母开头，不以点结尾
+	// 允许英文字母、数字、点和连字符，保留大小写，不随程序版本或位置变化
+	// Windows用于窗口身份，Linux用于程序名称
 	AppID string
 	// Title 指定窗口标题
 	Title string
@@ -507,11 +508,11 @@ func marshalReply(reply envelope) (data []byte) {
 // 入参: appID 应用标识
 // 返回: error 校验错误
 func validateAppID(appID string) error {
-	if len(appID) == 0 || len(appID) > 128 || appID[0] < 'a' || appID[0] > 'z' || strings.HasSuffix(appID, ".") {
+	if len(appID) == 0 || len(appID) > 128 || !(appID[0] >= 'a' && appID[0] <= 'z' || appID[0] >= 'A' && appID[0] <= 'Z') || strings.HasSuffix(appID, ".") {
 		return errors.New("invalid application ID")
 	}
 	for _, c := range appID {
-		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '.' || c == '-') {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '-') {
 			return errors.New("invalid application ID")
 		}
 	}
