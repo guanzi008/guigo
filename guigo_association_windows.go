@@ -91,6 +91,8 @@ func associationValues(o AssociationOptions) []associationValue {
 		id := o.AppID + "." + kind.ID
 		path := `Software\Classes\` + id
 		values = append(values, associationString(path, "", kind.Name),
+			associationString(path+`\Application`, "ApplicationName", o.Name),
+			associationString(path+`\Application`, "ApplicationIcon", icon),
 			associationString(path+`\DefaultIcon`, "", icon),
 			associationString(path+`\shell\open\command`, "", command))
 		for _, extension := range kind.Extensions {
