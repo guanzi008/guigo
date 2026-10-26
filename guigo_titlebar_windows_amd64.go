@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
 	"syscall"
 	"unsafe"
@@ -55,9 +56,12 @@ func (n *nativeWindow) setDragRegions(regions []Rect) error {
 		if n.options.TitleBar != TitleBarContent {
 			return errors.New("drag regions require content title bar")
 		}
+		if slices.Equal(n.dragRegions, regions) {
+			return nil
+		}
 		previous := n.dragRegions
 		n.dragRegions = regions
-		if err := n.layoutTitleBar(); err != nil {
+		if err := n.layoutDragRegions(); err != nil {
 			n.dragRegions = previous
 			return err
 		}
@@ -299,11 +303,6 @@ func (n *nativeWindow) layoutTitleBar() error {
 			return err
 		}
 	}
-	top := rect{Right: bounds.Right}
-	zoomed, _, _ := user32.NewProc("IsZoomed").Call(n.hwnd)
-	if zoomed == 0 && !n.options.FixedSize {
-		top.Bottom = min(bounds.Bottom, n.titleBarBorder())
-	}
 	content, err := titleBarRegion(bounds)
 	if err != nil {
 		return err
@@ -314,6 +313,23 @@ func (n *nativeWindow) layoutTitleBar() error {
 	}
 	if err := applyTitleBarRegion(n.contentWindow, content); err != nil {
 		return err
+	}
+	return n.layoutDragRegions()
+}
+
+// layoutDragRegions 更新命中层区域，不改变内容窗口的布局和裁剪
+// 返回: error 区域错误
+func (n *nativeWindow) layoutDragRegions() error {
+	if n.dragWindow == 0 {
+		return nil
+	}
+	var bounds rect
+	user32.NewProc("GetClientRect").Call(n.hwnd, uintptr(unsafe.Pointer(&bounds)))
+	_, buttons := n.titleBarBounds()
+	top := rect{Right: bounds.Right}
+	zoomed, _, _ := user32.NewProc("IsZoomed").Call(n.hwnd)
+	if zoomed == 0 && !n.options.FixedSize {
+		top.Bottom = min(bounds.Bottom, n.titleBarBorder())
 	}
 	drag, err := titleBarRegion(top)
 	if err != nil {
