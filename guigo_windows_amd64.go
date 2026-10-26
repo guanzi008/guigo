@@ -772,7 +772,7 @@ func (n *nativeWindow) initializeDPI() error {
 	return nil
 }
 
-// center 按指定显示器工作区定位初始窗口
+// center 按指定显示器工作区限制可调整窗口的初始尺寸并居中
 // 入参: monitor 显示器句柄
 // 返回: error 定位错误
 func (n *nativeWindow) center(monitor uintptr) error {
@@ -786,8 +786,12 @@ func (n *nativeWindow) center(monitor uintptr) error {
 	if ok == 0 {
 		return err
 	}
+	if !n.options.FixedSize {
+		bounds.Right = bounds.Left + min(bounds.Right-bounds.Left, info.Work.Right-info.Work.Left)
+		bounds.Bottom = bounds.Top + min(bounds.Bottom-bounds.Top, info.Work.Bottom-info.Work.Top)
+	}
 	position := centerPosition(bounds, info.Work)
-	ok, _, err = user32.NewProc("SetWindowPos").Call(n.hwnd, 0, uintptr(position.X), uintptr(position.Y), 0, 0, 0x15)
+	ok, _, err = user32.NewProc("SetWindowPos").Call(n.hwnd, 0, uintptr(position.X), uintptr(position.Y), uintptr(bounds.Right-bounds.Left), uintptr(bounds.Bottom-bounds.Top), 0x14)
 	if ok == 0 {
 		return err
 	}
