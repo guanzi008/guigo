@@ -135,7 +135,7 @@ type Options struct {
 	MaxHeight int
 	// FixedSize 禁止用户调整窗口大小，程序仍可调用SetSize
 	FixedSize bool
-	// Center 在首次显示前按所在屏幕工作区居中，超出工作区的方向靠齐起点，不改变窗口尺寸
+	// Center 在首次显示前将可见边框按所在屏幕工作区居中，可调整窗口同时限制初始尺寸
 	// Linux由窗口管理器决定窗口位置，GTK4不支持强制居中
 	Center bool
 	// Maximized 指定首次显示时最大化，FixedSize启用时忽略

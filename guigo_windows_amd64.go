@@ -772,7 +772,7 @@ func (n *nativeWindow) initializeDPI() error {
 	return nil
 }
 
-// center 按指定显示器工作区限制可调整窗口的初始尺寸并居中
+// center 按指定显示器工作区限制可调整窗口的初始尺寸并将可见边框居中
 // 入参: monitor 显示器句柄
 // 返回: error 定位错误
 func (n *nativeWindow) center(monitor uintptr) error {
@@ -786,11 +786,20 @@ func (n *nativeWindow) center(monitor uintptr) error {
 	if ok == 0 {
 		return err
 	}
+	var frame rect
+	hr, _, _ := dwmapi.NewProc("DwmGetWindowAttribute").Call(n.hwnd, 9, uintptr(unsafe.Pointer(&frame)), unsafe.Sizeof(frame))
+	if err := hresult(hr); err != nil {
+		return err
+	}
+	border := rect{Left: frame.Left - bounds.Left, Top: frame.Top - bounds.Top, Right: bounds.Right - frame.Right, Bottom: bounds.Bottom - frame.Bottom}
 	if !n.options.FixedSize {
 		bounds.Right = bounds.Left + min(bounds.Right-bounds.Left, info.Work.Right-info.Work.Left)
 		bounds.Bottom = bounds.Top + min(bounds.Bottom-bounds.Top, info.Work.Bottom-info.Work.Top)
 	}
-	position := centerPosition(bounds, info.Work)
+	frame = rect{Right: bounds.Right - bounds.Left - border.Left - border.Right, Bottom: bounds.Bottom - bounds.Top - border.Top - border.Bottom}
+	position := centerPosition(frame, info.Work)
+	position.X -= border.Left
+	position.Y -= border.Top
 	ok, _, err = user32.NewProc("SetWindowPos").Call(n.hwnd, 0, uintptr(position.X), uintptr(position.Y), uintptr(bounds.Right-bounds.Left), uintptr(bounds.Bottom-bounds.Top), 0x14)
 	if ok == 0 {
 		return err
@@ -798,8 +807,8 @@ func (n *nativeWindow) center(monitor uintptr) error {
 	return nil
 }
 
-// centerPosition 计算工作区内的窗口位置，保留负坐标显示器原点
-// 入参: bounds 窗口外框, work 显示器工作区
+// centerPosition 计算工作区内的可见窗口位置，保留负坐标显示器原点
+// 入参: bounds 可见边框, work 显示器工作区
 // 返回: point 窗口左上角坐标
 func centerPosition(bounds, work rect) point {
 	return point{
