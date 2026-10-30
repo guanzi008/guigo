@@ -853,7 +853,11 @@ func (n *nativeWindow) resize() {
 	}
 	if n.controller != nil {
 		var r rect
-		user32.NewProc("GetClientRect").Call(n.hwnd, uintptr(unsafe.Pointer(&r)))
+		hwnd := n.hwnd
+		if n.contentWindow != 0 {
+			hwnd = n.contentWindow
+		}
+		user32.NewProc("GetClientRect").Call(hwnd, uintptr(unsafe.Pointer(&r)))
 		com(n.controller, 6, uintptr(unsafe.Pointer(&r)))
 	}
 	n.scheduleTitleBarChange()

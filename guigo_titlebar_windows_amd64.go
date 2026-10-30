@@ -115,15 +115,28 @@ func (n *nativeWindow) titleBarBorder() int32 {
 	return n.titleBarMetric(33) + n.titleBarMetric(92)
 }
 
-// titleBarBounds 计算客户区内标题栏高度及右侧系统按钮保留矩形
+// titleBarOffset 返回最大化时移出屏幕的顶部边框高度
+// 返回: int32 内容区域的物理纵向偏移
+func (n *nativeWindow) titleBarOffset() int32 {
+	zoomed, _, _ := user32.NewProc("IsZoomed").Call(n.hwnd)
+	if zoomed != 0 {
+		return n.titleBarBorder()
+	}
+	return 0
+}
+
+// titleBarBounds 计算可见内容区的标题栏高度及右侧系统按钮保留矩形
 // 返回: int32 标题栏高度, rect 系统按钮保留矩形
 func (n *nativeWindow) titleBarBounds() (int32, rect) {
 	var client rect
 	user32.NewProc("GetClientRect").Call(n.hwnd, uintptr(unsafe.Pointer(&client)))
-	height := n.titleBarMetric(4) + n.titleBarBorder()
+	offset := n.titleBarOffset()
+	client.Bottom -= offset
+	height := n.titleBarMetric(4) + n.titleBarBorder() - offset
 	width := 3 * max(n.pixels(46), n.titleBarMetric(30))
 	origin := point{}
 	user32.NewProc("ClientToScreen").Call(n.hwnd, uintptr(unsafe.Pointer(&origin)))
+	origin.Y += offset
 	visible, _, _ := user32.NewProc("IsWindowVisible").Call(n.hwnd)
 	iconic, _, _ := user32.NewProc("IsIconic").Call(n.hwnd)
 	if visible != 0 && iconic == 0 {
@@ -355,8 +368,10 @@ func (n *nativeWindow) layoutTitleBar() error {
 	defer func() { n.titleBarLayout = false }()
 	var bounds rect
 	user32.NewProc("GetClientRect").Call(n.hwnd, uintptr(unsafe.Pointer(&bounds)))
+	offset := n.titleBarOffset()
+	bounds.Bottom -= offset
 	height, buttons := n.titleBarBounds()
-	margins := [4]int32{0, 0, height, 0}
+	margins := [4]int32{0, 0, height + offset, 0}
 	hr, _, _ := dwmapi.NewProc("DwmExtendFrameIntoClientArea").Call(n.hwnd, uintptr(unsafe.Pointer(&margins)))
 	if err := hresult(hr); err != nil {
 		return err
@@ -366,7 +381,7 @@ func (n *nativeWindow) layoutTitleBar() error {
 		if hwnd == n.dragWindow {
 			flags = 0x10
 		}
-		ok, _, err := user32.NewProc("SetWindowPos").Call(hwnd, 0, 0, 0, uintptr(bounds.Right), uintptr(bounds.Bottom), flags)
+		ok, _, err := user32.NewProc("SetWindowPos").Call(hwnd, 0, 0, uintptr(offset), uintptr(bounds.Right), uintptr(bounds.Bottom), flags)
 		if ok == 0 {
 			return err
 		}
@@ -392,7 +407,7 @@ func (n *nativeWindow) layoutDragRegions() error {
 		return nil
 	}
 	var bounds rect
-	user32.NewProc("GetClientRect").Call(n.hwnd, uintptr(unsafe.Pointer(&bounds)))
+	user32.NewProc("GetClientRect").Call(n.contentWindow, uintptr(unsafe.Pointer(&bounds)))
 	_, buttons := n.titleBarBounds()
 	top := rect{Right: bounds.Right}
 	zoomed, _, _ := user32.NewProc("IsZoomed").Call(n.hwnd)
@@ -495,10 +510,6 @@ func (n *nativeWindow) titleBarProc(hwnd, msg, wparam, lparam uintptr) (uintptr,
 		top := r.Top
 		user32.NewProc("DefWindowProcW").Call(hwnd, msg, wparam, lparam)
 		r.Top = top
-		zoomed, _, _ := user32.NewProc("IsZoomed").Call(hwnd)
-		if zoomed != 0 {
-			r.Top += n.titleBarBorder()
-		}
 		return 0, true
 	}
 	var result uintptr
@@ -510,8 +521,9 @@ func (n *nativeWindow) titleBarProc(hwnd, msg, wparam, lparam uintptr) (uintptr,
 		screen := point{X: int32(int16(lparam)), Y: int32(int16(lparam >> 16))}
 		p := screen
 		user32.NewProc("ScreenToClient").Call(hwnd, uintptr(unsafe.Pointer(&p)))
+		p.Y -= n.titleBarOffset()
 		var client rect
-		user32.NewProc("GetClientRect").Call(hwnd, uintptr(unsafe.Pointer(&client)))
+		user32.NewProc("GetClientRect").Call(n.contentWindow, uintptr(unsafe.Pointer(&client)))
 		if p.X >= 0 && p.X < client.Right && p.Y >= 0 && p.Y < client.Bottom {
 			zoomed, _, _ := user32.NewProc("IsZoomed").Call(hwnd)
 			if zoomed == 0 && !n.options.FixedSize && p.Y < n.titleBarBorder() {
