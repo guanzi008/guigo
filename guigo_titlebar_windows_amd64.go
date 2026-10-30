@@ -132,7 +132,7 @@ func (n *nativeWindow) titleBarBounds() (int32, rect) {
 	user32.NewProc("GetClientRect").Call(n.hwnd, uintptr(unsafe.Pointer(&client)))
 	offset := n.titleBarOffset()
 	client.Bottom -= offset
-	height := n.titleBarMetric(4) + n.titleBarBorder() - offset
+	height := n.titleBarMetric(4) + n.titleBarBorder()
 	width := 3 * max(n.pixels(46), n.titleBarMetric(30))
 	origin := point{}
 	user32.NewProc("ClientToScreen").Call(n.hwnd, uintptr(unsafe.Pointer(&origin)))
@@ -153,7 +153,6 @@ func (n *nativeWindow) titleBarBounds() (int32, rect) {
 		}
 		if left >= 0 && left < client.Right && bottom > 0 && bottom <= height+n.titleBarBorder() {
 			width = client.Right - left
-			height = max(height, bottom)
 		}
 	}
 	height = min(max(0, client.Bottom), height)
