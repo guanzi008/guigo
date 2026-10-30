@@ -123,6 +123,13 @@ func init() {
 	linuxCallbacks.dragPosition = purego.NewCallback(linuxDragPosition)
 }
 
+// SupportsTitleBarMaterial 查询当前平台是否提供指定标题栏材质
+// 入参: material 标题栏材质
+// 返回: bool 是否支持
+func SupportsTitleBarMaterial(material TitleBarMaterial) bool {
+	return material == TitleBarSolid
+}
+
 // run 在固定GTK线程创建窗口并等待退出
 // 入参: parent 运行上下文, o 宿主选项
 // 返回: error 启动或上下文错误

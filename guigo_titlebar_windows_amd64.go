@@ -22,6 +22,8 @@ import (
 	"strconv"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 var (
@@ -36,6 +38,13 @@ type titleBarButtonInfo struct {
 	Bounds rect
 	States [6]uint32
 	Rects  [6]rect
+}
+
+// SupportsTitleBarMaterial 查询当前平台是否提供指定标题栏材质，实际效果由系统外观设置决定
+// 入参: material 标题栏材质
+// 返回: bool 是否支持
+func SupportsTitleBarMaterial(material TitleBarMaterial) bool {
+	return material == TitleBarSolid || material == TitleBarMicaAlt && windows.RtlGetVersion().BuildNumber >= 22621
 }
 
 // titleBarInfo 在宿主线程查询标题栏布局

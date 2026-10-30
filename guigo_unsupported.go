@@ -21,6 +21,13 @@ import "context"
 // nativeWindow 提供未适配平台的宿主占位类型
 type nativeWindow struct{}
 
+// SupportsTitleBarMaterial 查询当前平台是否提供指定标题栏材质
+// 入参: material 标题栏材质
+// 返回: bool 未适配平台返回false
+func SupportsTitleBarMaterial(material TitleBarMaterial) bool {
+	return false
+}
+
 // activate 返回未适配平台错误
 // 返回: error 平台错误
 func (n *nativeWindow) activate() error {
