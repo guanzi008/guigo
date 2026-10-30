@@ -48,6 +48,29 @@ func (n *nativeWindow) titleBarInfo() (info TitleBarInfo, err error) {
 	return
 }
 
+// setTitleBarColors 在宿主线程更新系统标题栏并通知内容区域
+// 入参: colors 已校验的标题栏配色
+// 返回: error 模式或系统配色错误
+func (n *nativeWindow) setTitleBarColors(colors TitleBarColors) error {
+	return n.invoke(func() error {
+		if n.options.TitleBar != TitleBarContent {
+			return errors.New("title bar colors require content title bar")
+		}
+		if n.options.TitleBarColors == colors {
+			return nil
+		}
+		previous := n.options.TitleBarColors
+		n.options.TitleBarColors = colors
+		if err := n.applyTitleBarColors(n.currentTitleBarInfo().Active); err != nil {
+			n.options.TitleBarColors = previous
+			n.applyTitleBarColors(n.currentTitleBarInfo().Active)
+			return err
+		}
+		n.publishTitleBarChange(false)
+		return nil
+	})
+}
+
 // setDragRegions 在宿主线程替换拖动区域
 // 入参: regions 已复制并校验的逻辑像素矩形
 // 返回: error 设置错误
@@ -185,22 +208,24 @@ func titleBarColor(value string) uint32 {
 // 返回: error 系统配色错误，不支持配色属性的系统保留原生绘制
 func (n *nativeWindow) applyTitleBarColors(focused bool) error {
 	colors := n.options.TitleBarColors
-	if colors == (TitleBarColors{}) || n.hwnd == 0 {
+	if n.hwnd == 0 {
 		return nil
 	}
-	background, foreground := colors.Background, colors.Foreground
-	if !focused {
-		background, foreground = colors.InactiveBackground, colors.InactiveForeground
-	}
-	rgb := titleBarColor(background)
-	var dark uint32
-	if (rgb&0xff)*299+((rgb>>8)&0xff)*587+((rgb>>16)&0xff)*114 < 128000 {
-		dark = 1
+	background, foreground, dark := uint32(0xffffffff), uint32(0xffffffff), uint32(0)
+	if colors != (TitleBarColors{}) {
+		bg, fg := colors.Background, colors.Foreground
+		if !focused {
+			bg, fg = colors.InactiveBackground, colors.InactiveForeground
+		}
+		background, foreground = titleBarColor(bg), titleBarColor(fg)
+		if (background&0xff)*299+((background>>8)&0xff)*587+((background>>16)&0xff)*114 < 128000 {
+			dark = 1
+		}
 	}
 	for _, attribute := range []struct {
 		id    uintptr
 		color uint32
-	}{{20, dark}, {35, rgb}, {36, titleBarColor(foreground)}} {
+	}{{20, dark}, {35, background}, {36, foreground}} {
 		hr, _, _ := dwmapi.NewProc("DwmSetWindowAttribute").Call(n.hwnd, attribute.id, uintptr(unsafe.Pointer(&attribute.color)), unsafe.Sizeof(attribute.color))
 		if uint32(hr) != 0x80070057 && uint32(hr) != 0x80004001 {
 			if err := hresult(hr); err != nil {

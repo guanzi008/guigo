@@ -731,11 +731,12 @@ func (n *nativeWindow) initTitleBarColors() {
 		return
 	}
 	n.captionStyle, n.captionDisplay = gtk.CSSProviderNew(), gtk.Display(n.window)
-	css := fmt.Sprintf(".guigo-caption { background-color: %s; color: %s; } .guigo-caption:backdrop { background-color: %s; color: %s; } .guigo-caption button:not(:hover):not(:active) { color: inherit; }", colors.Background, colors.Foreground, colors.InactiveBackground, colors.InactiveForeground)
+	class := fmt.Sprintf("guigo-caption-%x", n.window)
+	css := fmt.Sprintf(".%s { background-color: %s; color: %s; } .%s:backdrop { background-color: %s; color: %s; } .%s button:not(:hover):not(:active) { color: inherit; }", class, colors.Background, colors.Foreground, class, colors.InactiveBackground, colors.InactiveForeground, class)
 	gtk.CSSLoad(n.captionStyle, css, int64(len(css)))
 	gtk.CSSAdd(n.captionDisplay, n.captionStyle, 600)
 	for _, controls := range n.captionControls {
-		gtk.CSSClass(controls, "guigo-caption")
+		gtk.CSSClass(controls, class)
 	}
 }
 
@@ -757,6 +758,24 @@ func (n *nativeWindow) titleBarInfo() (TitleBarInfo, error) {
 		return TitleBarInfo{}, ErrClosed
 	}
 	return n.titleInfo, nil
+}
+
+// setTitleBarColors 在GTK线程更新当前窗口配色并发布标题栏状态
+// 入参: colors 已校验的标题栏配色
+// 返回: error 模式或调度错误
+func (n *nativeWindow) setTitleBarColors(colors TitleBarColors) error {
+	if n.options.TitleBar != TitleBarContent {
+		return errors.New("title bar colors require content title bar")
+	}
+	return n.enqueue(func() {
+		if n.options.TitleBarColors == colors {
+			return
+		}
+		n.freeTitleBarColors()
+		n.options.TitleBarColors = colors
+		n.initTitleBarColors()
+		n.updateTitleInfo()
+	})
 }
 
 // setDragRegions 复制逻辑像素区域并交给GTK原生WindowHandle处理真实输入事件

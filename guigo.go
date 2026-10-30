@@ -341,6 +341,37 @@ func (w *Window) TitleBarInfo() (TitleBarInfo, error) {
 	return w.native.titleBarInfo()
 }
 
+// SetTitleBarColors 更新内容标题栏配色，零值恢复系统外观，系统标题栏模式返回错误
+// 入参: colors 激活及失焦配色，非零值必须完整提供四种#RRGGBB颜色
+// 返回: error 配色、模式或窗口错误
+func (w *Window) SetTitleBarColors(colors TitleBarColors) error {
+	if w == nil || w.native == nil {
+		return ErrClosed
+	}
+	if err := validateTitleBarColors(colors); err != nil {
+		return err
+	}
+	return w.native.setTitleBarColors(colors)
+}
+
+// validateTitleBarColors 校验内容标题栏的完整配色或系统默认值
+// 入参: colors 标题栏配色
+// 返回: error 配色错误
+func validateTitleBarColors(colors TitleBarColors) error {
+	if colors == (TitleBarColors{}) {
+		return nil
+	}
+	for _, value := range []string{colors.Background, colors.Foreground, colors.InactiveBackground, colors.InactiveForeground} {
+		if len(value) != 7 || value[0] != '#' {
+			return errors.New("title bar color must use #RRGGBB")
+		}
+		if _, err := hex.DecodeString(value[1:]); err != nil {
+			return errors.New("title bar color must use #RRGGBB")
+		}
+	}
+	return nil
+}
+
 // SetDragRegions 替换内容标题栏的原生拖动区域，空切片清除区域，系统模式返回错误
 // 区域使用客户区逻辑像素，不随页面缩放变化，调用方负责排除交互控件并随布局更新
 // 超出客户区的部分裁剪，系统按钮及调整大小的边缘优先，不改变页面内容或注入JS接口
@@ -542,13 +573,8 @@ func validate(o *Options) error {
 		if o.TitleBar != TitleBarContent {
 			return errors.New("title bar colors require content title bar")
 		}
-		for _, value := range []string{o.TitleBarColors.Background, o.TitleBarColors.Foreground, o.TitleBarColors.InactiveBackground, o.TitleBarColors.InactiveForeground} {
-			if len(value) != 7 || value[0] != '#' {
-				return errors.New("title bar color must use #RRGGBB")
-			}
-			if _, err := hex.DecodeString(value[1:]); err != nil {
-				return errors.New("title bar color must use #RRGGBB")
-			}
+		if err := validateTitleBarColors(o.TitleBarColors); err != nil {
+			return err
 		}
 	}
 	if o.AppID != "" {
