@@ -960,6 +960,9 @@ func windowProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 // setup 注册资源与桥接并等待注入完成后导航
 // 返回: error 初始化错误
 func (n *nativeWindow) setup() error {
+	if err := n.initializeTitleBarMaterial(); err != nil {
+		return err
+	}
 	n.resize()
 	if err := hresult(com(n.controller, 4, 1)); err != nil {
 		return err

@@ -37,6 +37,13 @@ const (
 	TitleBarContent
 )
 
+const (
+	// TitleBarSolid 使用不透明标题栏背景，为默认值
+	TitleBarSolid TitleBarMaterial = iota
+	// TitleBarMicaAlt 使用Windows 11的Mica Alt标题栏材质
+	TitleBarMicaAlt
+)
+
 var (
 	// ErrUnsupportedPlatform 表示当前平台没有可用宿主实现
 	ErrUnsupportedPlatform = errors.New("unsupported platform")
@@ -62,6 +69,9 @@ type Result struct {
 
 // TitleBarMode 定义窗口标题栏的显示方式
 type TitleBarMode uint8
+
+// TitleBarMaterial 定义内容标题栏的背景材质
+type TitleBarMaterial uint8
 
 // TitleBarColors 定义内容标题栏的激活及失焦配色，颜色使用#RRGGBB格式
 type TitleBarColors struct {
@@ -101,6 +111,8 @@ type TitleBarInfo struct {
 	Maximized bool `json:"maximized"`
 	// Colors 提供与系统按钮区域共用的内容标题栏配色，零值使用系统外观
 	Colors TitleBarColors `json:"colors"`
+	// Material 提供内容标题栏材质，非纯色材质需要页面使用透明背景
+	Material TitleBarMaterial `json:"material"`
 }
 
 // Options 定义窗口、资源和生命周期配置，客户区尺寸单位为逻辑像素
@@ -117,6 +129,10 @@ type Options struct {
 	TitleBar TitleBarMode
 	// TitleBarColors 指定内容标题栏配色，零值保留系统外观，非零值需完整提供四种颜色
 	TitleBarColors TitleBarColors
+	// TitleBarMaterial 指定内容标题栏材质，零值保持纯色，仅Windows 11 Build 22621及以上支持Mica Alt
+	// 页面根元素及标题栏需使用透明背景，其他内容区域保持自身底色
+	// 材质背景由系统绘制，TitleBarColors用于决定明暗及文字颜色，不支持材质时返回错误
+	TitleBarMaterial TitleBarMaterial
 	// Icon 指定正方形PNG窗口图标数据，边长不超过2048像素，数据不超过16MiB，与IconPath互斥
 	Icon []byte
 	// IconPath 指定外置PNG图标路径，格式及尺寸限制与Icon一致，两者互斥
@@ -568,6 +584,17 @@ func validateAppID(appID string) error {
 func validate(o *Options) error {
 	if o.TitleBar != TitleBarSystem && o.TitleBar != TitleBarContent {
 		return errors.New("invalid title bar mode")
+	}
+	if o.TitleBarMaterial != TitleBarSolid && o.TitleBarMaterial != TitleBarMicaAlt {
+		return errors.New("invalid title bar material")
+	}
+	if o.TitleBarMaterial != TitleBarSolid {
+		if o.TitleBar != TitleBarContent {
+			return errors.New("title bar material requires content title bar")
+		}
+		if runtime.GOOS != "windows" || runtime.GOARCH != "amd64" {
+			return ErrUnsupportedPlatform
+		}
 	}
 	if o.TitleBarColors != (TitleBarColors{}) {
 		if o.TitleBar != TitleBarContent {

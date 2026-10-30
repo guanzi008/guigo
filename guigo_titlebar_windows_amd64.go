@@ -146,6 +146,7 @@ func (n *nativeWindow) currentTitleBarInfo() TitleBarInfo {
 	info := TitleBarInfo{Active: foreground == n.hwnd, Maximized: zoomed != 0}
 	if n.options.TitleBar == TitleBarContent {
 		info.Colors = n.options.TitleBarColors
+		info.Material = n.options.TitleBarMaterial
 		height, buttons := n.titleBarBounds()
 		scale := float64(n.dpi) / 96
 		info.Height = float64(height) / scale
@@ -169,12 +170,22 @@ func (n *nativeWindow) initializeTitleBar() error {
 	if composition == 0 {
 		return errors.New("content title bar requires desktop composition")
 	}
+	if n.options.TitleBarMaterial == TitleBarMicaAlt {
+		material := uint32(4)
+		hr, _, _ := dwmapi.NewProc("DwmSetWindowAttribute").Call(n.hwnd, 38, uintptr(unsafe.Pointer(&material)), unsafe.Sizeof(material))
+		if err := hresult(hr); err != nil {
+			return fmt.Errorf("Mica Alt title bar: %w", err)
+		}
+	}
 	if err := n.applyTitleBarColors(n.currentTitleBarInfo().Active); err != nil {
 		return err
 	}
 	instance, _, _ := kernel32.NewProc("GetModuleHandleW").Call(0)
 	cursor, _, _ := user32.NewProc("LoadCursorW").Call(0, 32512)
 	background, _, _ := gdi32.NewProc("GetStockObject").Call(4)
+	if n.options.TitleBarMaterial == TitleBarMicaAlt {
+		background, _, _ = gdi32.NewProc("GetStockObject").Call(5)
+	}
 	class := windowClass{Style: 8, Proc: titleBarCallback, Instance: instance, Cursor: cursor, Background: background, Name: wide("GUIGo.Native.Content")}
 	class.Size = uint32(unsafe.Sizeof(class))
 	atom, _, err := user32.NewProc("RegisterClassExW").Call(uintptr(unsafe.Pointer(&class)))
@@ -227,6 +238,9 @@ func (n *nativeWindow) applyTitleBarColors(focused bool) error {
 			dark = 1
 		}
 	}
+	if n.options.TitleBarMaterial == TitleBarMicaAlt {
+		background = 0xffffffff
+	}
 	for _, attribute := range []struct {
 		id    uintptr
 		color uint32
@@ -240,6 +254,21 @@ func (n *nativeWindow) applyTitleBarColors(focused bool) error {
 	}
 	user32.NewProc("RedrawWindow").Call(n.hwnd, 0, 0, 0x405)
 	return nil
+}
+
+// initializeTitleBarMaterial 设置WebView透明底色，使内容标题栏透出宿主的系统材质
+// 返回: error WebView接口或背景设置错误
+func (n *nativeWindow) initializeTitleBarMaterial() error {
+	if n.options.TitleBarMaterial == TitleBarSolid {
+		return nil
+	}
+	iid := guid("{C979903E-D4CA-4228-92EB-47EE3FA96EAB}")
+	var controller *comObject
+	if err := hresult(com(n.controller, 0, uintptr(unsafe.Pointer(&iid)), uintptr(unsafe.Pointer(&controller)))); err != nil {
+		return err
+	}
+	defer release(controller)
+	return hresult(com(controller, 27, 0))
 }
 
 // unregisterTitleBar 在所有自有子窗口销毁后释放窗口类
