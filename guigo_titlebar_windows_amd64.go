@@ -109,24 +109,29 @@ func (n *nativeWindow) titleBarBorder() int32 {
 // titleBarBounds 计算客户区内标题栏高度及右侧系统按钮保留矩形
 // 返回: int32 标题栏高度, rect 系统按钮保留矩形
 func (n *nativeWindow) titleBarBounds() (int32, rect) {
-	var client, window, buttons rect
+	var client rect
 	user32.NewProc("GetClientRect").Call(n.hwnd, uintptr(unsafe.Pointer(&client)))
 	height := n.titleBarMetric(4) + n.titleBarBorder()
 	width := 3 * max(n.pixels(46), n.titleBarMetric(30))
 	origin := point{}
 	user32.NewProc("ClientToScreen").Call(n.hwnd, uintptr(unsafe.Pointer(&origin)))
-	user32.NewProc("GetWindowRect").Call(n.hwnd, uintptr(unsafe.Pointer(&window)))
 	visible, _, _ := user32.NewProc("IsWindowVisible").Call(n.hwnd)
 	iconic, _, _ := user32.NewProc("IsIconic").Call(n.hwnd)
 	if visible != 0 && iconic == 0 {
-		hr, _, _ := dwmapi.NewProc("DwmGetWindowAttribute").Call(n.hwnd, 5, uintptr(unsafe.Pointer(&buttons)), unsafe.Sizeof(buttons))
-		if hresult(hr) == nil && buttons.Right > buttons.Left && buttons.Bottom > buttons.Top {
-			left := window.Left + buttons.Left - origin.X
-			bottom := window.Top + buttons.Bottom - origin.Y
-			if left >= 0 && left < client.Right && bottom > 0 && bottom <= height+n.titleBarBorder() {
-				width = client.Right - left
-				height = max(height, bottom)
+		var buttons titleBarButtonInfo
+		buttons.Size = uint32(unsafe.Sizeof(buttons))
+		user32.NewProc("DefWindowProcW").Call(n.hwnd, 0x33f, 0, uintptr(unsafe.Pointer(&buttons)))
+		left, bottom := client.Right, int32(0)
+		for _, index := range []int{2, 3, 4, 5} {
+			r := buttons.Rects[index]
+			if buttons.States[index]&0x18000 == 0 && r.Right > r.Left && r.Bottom > r.Top {
+				left = min(left, r.Left-origin.X)
+				bottom = max(bottom, r.Bottom-origin.Y)
 			}
+		}
+		if left >= 0 && left < client.Right && bottom > 0 && bottom <= height+n.titleBarBorder() {
+			width = client.Right - left
+			height = max(height, bottom)
 		}
 	}
 	height = min(max(0, client.Bottom), height)
