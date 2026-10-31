@@ -44,7 +44,7 @@ type titleBarButtonInfo struct {
 // 入参: material 标题栏材质
 // 返回: bool 是否支持
 func SupportsTitleBarMaterial(material TitleBarMaterial) bool {
-	return material == TitleBarSolid || (material == TitleBarMicaAlt || material == TitleBarAcrylic) && windows.RtlGetVersion().BuildNumber >= 22621
+	return material == TitleBarSolid || (material == TitleBarMica || material == TitleBarAcrylic) && windows.RtlGetVersion().BuildNumber >= 22621
 }
 
 // titleBarInfo 在宿主线程查询标题栏布局
@@ -107,7 +107,7 @@ func (n *nativeWindow) setTitleBarMaterial(material TitleBarMaterial) error {
 func (n *nativeWindow) applyTitleBarBackdrop() error {
 	material := uint32(1)
 	switch n.options.TitleBarMaterial {
-	case TitleBarMicaAlt:
+	case TitleBarMica:
 		material = 4
 	case TitleBarAcrylic:
 		material = 3
@@ -239,7 +239,7 @@ func (n *nativeWindow) initializeTitleBar() error {
 	if composition == 0 {
 		return errors.New("content title bar requires desktop composition")
 	}
-	if SupportsTitleBarMaterial(TitleBarMicaAlt) {
+	if SupportsTitleBarMaterial(TitleBarMica) {
 		if err := n.applyTitleBarBackdrop(); err != nil {
 			return err
 		}
