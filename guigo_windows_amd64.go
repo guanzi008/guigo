@@ -873,6 +873,14 @@ func windowProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 			return result
 		}
 		switch msg {
+		case 0x14:
+			if n.options.WindowMaterial != WindowSolid {
+				var bounds rect
+				user32.NewProc("GetClientRect").Call(hwnd, uintptr(unsafe.Pointer(&bounds)))
+				brush, _, _ := gdi32.NewProc("GetStockObject").Call(4)
+				user32.NewProc("FillRect").Call(wparam, uintptr(unsafe.Pointer(&bounds)), brush)
+				return 1
+			}
 		case 0x8001:
 			n.mu.Lock()
 			q := n.queue
@@ -964,7 +972,7 @@ func windowProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 // setup 注册资源与桥接并等待注入完成后导航
 // 返回: error 初始化错误
 func (n *nativeWindow) setup() error {
-	if err := n.initializeTitleBarMaterial(); err != nil {
+	if err := n.initializeWindowMaterial(); err != nil {
 		return err
 	}
 	n.resize()

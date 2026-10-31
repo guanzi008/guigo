@@ -123,11 +123,11 @@ func init() {
 	linuxCallbacks.dragPosition = purego.NewCallback(linuxDragPosition)
 }
 
-// SupportsTitleBarMaterial 查询当前平台是否提供指定标题栏材质
-// 入参: material 标题栏材质
+// SupportsWindowMaterial 查询当前平台是否提供指定窗口材质
+// 入参: material 窗口材质
 // 返回: bool 是否支持
-func SupportsTitleBarMaterial(material TitleBarMaterial) bool {
-	return material == TitleBarSolid
+func SupportsWindowMaterial(material WindowMaterial) bool {
+	return material == WindowSolid
 }
 
 // run 在固定GTK线程创建窗口并等待退出
@@ -785,13 +785,10 @@ func (n *nativeWindow) setTitleBarColors(colors TitleBarColors) error {
 	})
 }
 
-// setTitleBarMaterial 保持GTK窗口的纯色标题栏
+// setWindowMaterial 保持GTK窗口的纯色背景
 // 入参: material 已校验的平台可用材质
-// 返回: error 模式或调度错误
-func (n *nativeWindow) setTitleBarMaterial(material TitleBarMaterial) error {
-	if n.options.TitleBar != TitleBarContent {
-		return errors.New("title bar material requires content title bar")
-	}
+// 返回: error 调度错误
+func (n *nativeWindow) setWindowMaterial(material WindowMaterial) error {
 	return n.enqueue(func() {})
 }
 

@@ -38,12 +38,12 @@ const (
 )
 
 const (
-	// TitleBarSolid 使用纯色标题栏材质，为默认值
-	TitleBarSolid TitleBarMaterial = iota
-	// TitleBarMica 使用云母标题栏材质
-	TitleBarMica
-	// TitleBarAcrylic 使用亚克力标题栏材质
-	TitleBarAcrylic
+	// WindowSolid 使用纯色窗口材质，为默认值
+	WindowSolid WindowMaterial = iota
+	// WindowMica 使用云母窗口材质
+	WindowMica
+	// WindowAcrylic 使用亚克力窗口材质
+	WindowAcrylic
 )
 
 var (
@@ -72,8 +72,8 @@ type Result struct {
 // TitleBarMode 定义窗口标题栏的显示方式
 type TitleBarMode uint8
 
-// TitleBarMaterial 定义内容标题栏的背景材质
-type TitleBarMaterial uint8
+// WindowMaterial 定义窗口的背景材质
+type WindowMaterial uint8
 
 // TitleBarColors 定义内容标题栏的激活及失焦配色，颜色使用#RRGGBB格式
 type TitleBarColors struct {
@@ -113,8 +113,8 @@ type TitleBarInfo struct {
 	Maximized bool `json:"maximized"`
 	// Colors 提供与系统按钮区域共用的内容标题栏配色，零值使用系统外观
 	Colors TitleBarColors `json:"colors"`
-	// Material 提供内容标题栏材质，非纯色材质需要页面使用透明背景
-	Material TitleBarMaterial `json:"material"`
+	// Material 提供窗口材质，非纯色材质需要页面使用透明背景
+	Material WindowMaterial `json:"material"`
 }
 
 // Options 定义窗口、资源和生命周期配置，客户区尺寸单位为逻辑像素
@@ -131,10 +131,10 @@ type Options struct {
 	TitleBar TitleBarMode
 	// TitleBarColors 指定内容标题栏配色，零值保留系统外观，非零值需完整提供四种颜色
 	TitleBarColors TitleBarColors
-	// TitleBarMaterial 指定内容标题栏材质，零值保持纯色，仅Windows11版本22621及以上支持云母和亚克力
-	// 页面根元素及标题栏需使用透明背景，其他内容区域保持自身底色
+	// WindowMaterial 指定窗口材质，零值保持纯色，仅Windows11版本22621及以上支持云母和亚克力
+	// 页面根元素及需要显示材质的区域使用透明背景，其余区域保留自身底色
 	// 材质背景由系统绘制，TitleBarColors用于决定明暗及文字颜色，不支持材质时返回错误
-	TitleBarMaterial TitleBarMaterial
+	WindowMaterial WindowMaterial
 	// Icon 指定正方形PNG窗口图标数据，边长不超过2048像素，数据不超过16MiB，与IconPath互斥
 	Icon []byte
 	// IconPath 指定外置PNG图标路径，格式及尺寸限制与Icon一致，两者互斥
@@ -372,20 +372,20 @@ func (w *Window) SetTitleBarColors(colors TitleBarColors) error {
 	return w.native.setTitleBarColors(colors)
 }
 
-// SetTitleBarMaterial 更新内容标题栏材质，系统标题栏模式或不支持的材质返回错误
-// 入参: material 标题栏材质，纯色关闭系统背景材质
-// 返回: error 材质、模式或窗口错误
-func (w *Window) SetTitleBarMaterial(material TitleBarMaterial) error {
+// SetWindowMaterial 更新窗口背景材质，不支持的材质返回错误
+// 入参: material 窗口材质，纯色关闭系统背景材质
+// 返回: error 材质或窗口错误
+func (w *Window) SetWindowMaterial(material WindowMaterial) error {
 	if w == nil || w.native == nil {
 		return ErrClosed
 	}
-	if material != TitleBarSolid && material != TitleBarMica && material != TitleBarAcrylic {
-		return errors.New("invalid title bar material")
+	if material != WindowSolid && material != WindowMica && material != WindowAcrylic {
+		return errors.New("invalid window material")
 	}
-	if !SupportsTitleBarMaterial(material) {
+	if !SupportsWindowMaterial(material) {
 		return ErrUnsupportedPlatform
 	}
-	return w.native.setTitleBarMaterial(material)
+	return w.native.setWindowMaterial(material)
 }
 
 // validateTitleBarColors 校验内容标题栏的完整配色或系统默认值
@@ -603,14 +603,11 @@ func validate(o *Options) error {
 	if o.TitleBar != TitleBarSystem && o.TitleBar != TitleBarContent {
 		return errors.New("invalid title bar mode")
 	}
-	if o.TitleBarMaterial != TitleBarSolid && o.TitleBarMaterial != TitleBarMica && o.TitleBarMaterial != TitleBarAcrylic {
-		return errors.New("invalid title bar material")
+	if o.WindowMaterial != WindowSolid && o.WindowMaterial != WindowMica && o.WindowMaterial != WindowAcrylic {
+		return errors.New("invalid window material")
 	}
-	if o.TitleBarMaterial != TitleBarSolid {
-		if o.TitleBar != TitleBarContent {
-			return errors.New("title bar material requires content title bar")
-		}
-		if !SupportsTitleBarMaterial(o.TitleBarMaterial) {
+	if o.WindowMaterial != WindowSolid {
+		if !SupportsWindowMaterial(o.WindowMaterial) {
 			return ErrUnsupportedPlatform
 		}
 	}
