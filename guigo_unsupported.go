@@ -157,3 +157,10 @@ func (n *nativeWindow) dialogs(o DialogOptions, mode int) ([]string, error) {
 func (n *nativeWindow) setTitleBarColors(colors TitleBarColors) error {
 	return ErrUnsupportedPlatform
 }
+
+// setTitleBarMaterial 返回未适配平台错误
+// 入参: material 标题栏材质
+// 返回: error 平台错误
+func (n *nativeWindow) setTitleBarMaterial(material TitleBarMaterial) error {
+	return ErrUnsupportedPlatform
+}

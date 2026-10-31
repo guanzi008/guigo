@@ -44,7 +44,7 @@ type titleBarButtonInfo struct {
 // 入参: material 标题栏材质
 // 返回: bool 是否支持
 func SupportsTitleBarMaterial(material TitleBarMaterial) bool {
-	return material == TitleBarSolid || material == TitleBarMicaAlt && windows.RtlGetVersion().BuildNumber >= 22621
+	return material == TitleBarSolid || (material == TitleBarMicaAlt || material == TitleBarAcrylic) && windows.RtlGetVersion().BuildNumber >= 22621
 }
 
 // titleBarInfo 在宿主线程查询标题栏布局
@@ -78,6 +78,54 @@ func (n *nativeWindow) setTitleBarColors(colors TitleBarColors) error {
 		n.publishTitleBarChange(false)
 		return nil
 	})
+}
+
+// setTitleBarMaterial 在宿主线程切换材质，失败时恢复当前窗口外观
+// 入参: material 已校验的标题栏材质
+// 返回: error 模式、系统材质或WebView错误
+func (n *nativeWindow) setTitleBarMaterial(material TitleBarMaterial) error {
+	return n.invoke(func() error {
+		if n.options.TitleBar != TitleBarContent {
+			return errors.New("title bar material requires content title bar")
+		}
+		if n.options.TitleBarMaterial == material {
+			return nil
+		}
+		previous := n.options.TitleBarMaterial
+		n.options.TitleBarMaterial = material
+		if err := n.applyTitleBarMaterial(); err != nil {
+			n.options.TitleBarMaterial = previous
+			return errors.Join(err, n.applyTitleBarMaterial())
+		}
+		n.publishTitleBarChange(false)
+		return nil
+	})
+}
+
+// applyTitleBarBackdrop 设置当前窗口的DWM背景材质
+// 返回: error 系统材质设置错误
+func (n *nativeWindow) applyTitleBarBackdrop() error {
+	material := uint32(1)
+	switch n.options.TitleBarMaterial {
+	case TitleBarMicaAlt:
+		material = 4
+	case TitleBarAcrylic:
+		material = 3
+	}
+	hr, _, _ := dwmapi.NewProc("DwmSetWindowAttribute").Call(n.hwnd, 38, uintptr(unsafe.Pointer(&material)), unsafe.Sizeof(material))
+	return hresult(hr)
+}
+
+// applyTitleBarMaterial 同步窗口材质、系统配色及WebView底色
+// 返回: error 系统或WebView设置错误
+func (n *nativeWindow) applyTitleBarMaterial() error {
+	if err := n.applyTitleBarBackdrop(); err != nil {
+		return err
+	}
+	if err := n.applyTitleBarBackground(); err != nil {
+		return err
+	}
+	return n.applyTitleBarColors(n.currentTitleBarInfo().Active)
 }
 
 // setDragRegions 在宿主线程替换拖动区域
@@ -191,11 +239,9 @@ func (n *nativeWindow) initializeTitleBar() error {
 	if composition == 0 {
 		return errors.New("content title bar requires desktop composition")
 	}
-	if n.options.TitleBarMaterial == TitleBarMicaAlt {
-		material := uint32(4)
-		hr, _, _ := dwmapi.NewProc("DwmSetWindowAttribute").Call(n.hwnd, 38, uintptr(unsafe.Pointer(&material)), unsafe.Sizeof(material))
-		if err := hresult(hr); err != nil {
-			return fmt.Errorf("Mica Alt title bar: %w", err)
+	if SupportsTitleBarMaterial(TitleBarMicaAlt) {
+		if err := n.applyTitleBarBackdrop(); err != nil {
+			return err
 		}
 	}
 	if err := n.applyTitleBarColors(n.currentTitleBarInfo().Active); err != nil {
@@ -203,10 +249,7 @@ func (n *nativeWindow) initializeTitleBar() error {
 	}
 	instance, _, _ := kernel32.NewProc("GetModuleHandleW").Call(0)
 	cursor, _, _ := user32.NewProc("LoadCursorW").Call(0, 32512)
-	background, _, _ := gdi32.NewProc("GetStockObject").Call(4)
-	if n.options.TitleBarMaterial == TitleBarMicaAlt {
-		background, _, _ = gdi32.NewProc("GetStockObject").Call(5)
-	}
+	background, _, _ := gdi32.NewProc("GetStockObject").Call(5)
 	class := windowClass{Style: 8, Proc: titleBarCallback, Instance: instance, Cursor: cursor, Background: background, Name: wide("GUIGo.Native.Content")}
 	class.Size = uint32(unsafe.Sizeof(class))
 	atom, _, err := user32.NewProc("RegisterClassExW").Call(uintptr(unsafe.Pointer(&class)))
@@ -259,7 +302,7 @@ func (n *nativeWindow) applyTitleBarColors(focused bool) error {
 			dark = 1
 		}
 	}
-	if n.options.TitleBarMaterial == TitleBarMicaAlt {
+	if n.options.TitleBarMaterial != TitleBarSolid {
 		background = 0xffffffff
 	}
 	for _, attribute := range []struct {
@@ -283,13 +326,23 @@ func (n *nativeWindow) initializeTitleBarMaterial() error {
 	if n.options.TitleBarMaterial == TitleBarSolid {
 		return nil
 	}
+	return n.applyTitleBarBackground()
+}
+
+// applyTitleBarBackground 根据当前材质设置WebView底色
+// 返回: error WebView接口或背景设置错误
+func (n *nativeWindow) applyTitleBarBackground() error {
 	iid := guid("{C979903E-D4CA-4228-92EB-47EE3FA96EAB}")
 	var controller *comObject
 	if err := hresult(com(n.controller, 0, uintptr(unsafe.Pointer(&iid)), uintptr(unsafe.Pointer(&controller)))); err != nil {
 		return err
 	}
 	defer release(controller)
-	return hresult(com(controller, 27, 0))
+	color := uintptr(0)
+	if n.options.TitleBarMaterial == TitleBarSolid {
+		color = 0xffffffff
+	}
+	return hresult(com(controller, 27, color))
 }
 
 // unregisterTitleBar 在所有自有子窗口销毁后释放窗口类

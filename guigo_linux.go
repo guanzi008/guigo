@@ -785,6 +785,16 @@ func (n *nativeWindow) setTitleBarColors(colors TitleBarColors) error {
 	})
 }
 
+// setTitleBarMaterial 保持GTK窗口的纯色标题栏
+// 入参: material 已校验的平台可用材质
+// 返回: error 模式或调度错误
+func (n *nativeWindow) setTitleBarMaterial(material TitleBarMaterial) error {
+	if n.options.TitleBar != TitleBarContent {
+		return errors.New("title bar material requires content title bar")
+	}
+	return n.enqueue(func() {})
+}
+
 // setDragRegions 复制逻辑像素区域并交给GTK原生WindowHandle处理真实输入事件
 // GTK手势使用实际GdkEvent的设备、时间戳和原生坐标，保留系统双击动作及窗口菜单
 // 入参: regions 客户区拖动矩形，空切片清除全部区域

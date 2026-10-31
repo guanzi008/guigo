@@ -42,6 +42,8 @@ const (
 	TitleBarSolid TitleBarMaterial = iota
 	// TitleBarMicaAlt 使用Windows 11的Mica Alt标题栏材质
 	TitleBarMicaAlt
+	// TitleBarAcrylic 使用Windows 11的亚克力标题栏材质
+	TitleBarAcrylic
 )
 
 var (
@@ -129,7 +131,7 @@ type Options struct {
 	TitleBar TitleBarMode
 	// TitleBarColors 指定内容标题栏配色，零值保留系统外观，非零值需完整提供四种颜色
 	TitleBarColors TitleBarColors
-	// TitleBarMaterial 指定内容标题栏材质，零值保持纯色，仅Windows 11 Build 22621及以上支持Mica Alt
+	// TitleBarMaterial 指定内容标题栏材质，零值保持纯色，仅Windows 11 Build 22621及以上支持Mica Alt和亚克力
 	// 页面根元素及标题栏需使用透明背景，其他内容区域保持自身底色
 	// 材质背景由系统绘制，TitleBarColors用于决定明暗及文字颜色，不支持材质时返回错误
 	TitleBarMaterial TitleBarMaterial
@@ -370,6 +372,22 @@ func (w *Window) SetTitleBarColors(colors TitleBarColors) error {
 	return w.native.setTitleBarColors(colors)
 }
 
+// SetTitleBarMaterial 更新内容标题栏材质，系统标题栏模式或不支持的材质返回错误
+// 入参: material 标题栏材质，纯色关闭系统背景材质
+// 返回: error 材质、模式或窗口错误
+func (w *Window) SetTitleBarMaterial(material TitleBarMaterial) error {
+	if w == nil || w.native == nil {
+		return ErrClosed
+	}
+	if material != TitleBarSolid && material != TitleBarMicaAlt && material != TitleBarAcrylic {
+		return errors.New("invalid title bar material")
+	}
+	if !SupportsTitleBarMaterial(material) {
+		return ErrUnsupportedPlatform
+	}
+	return w.native.setTitleBarMaterial(material)
+}
+
 // validateTitleBarColors 校验内容标题栏的完整配色或系统默认值
 // 入参: colors 标题栏配色
 // 返回: error 配色错误
@@ -585,14 +603,14 @@ func validate(o *Options) error {
 	if o.TitleBar != TitleBarSystem && o.TitleBar != TitleBarContent {
 		return errors.New("invalid title bar mode")
 	}
-	if o.TitleBarMaterial != TitleBarSolid && o.TitleBarMaterial != TitleBarMicaAlt {
+	if o.TitleBarMaterial != TitleBarSolid && o.TitleBarMaterial != TitleBarMicaAlt && o.TitleBarMaterial != TitleBarAcrylic {
 		return errors.New("invalid title bar material")
 	}
 	if o.TitleBarMaterial != TitleBarSolid {
 		if o.TitleBar != TitleBarContent {
 			return errors.New("title bar material requires content title bar")
 		}
-		if runtime.GOOS != "windows" || runtime.GOARCH != "amd64" {
+		if !SupportsTitleBarMaterial(o.TitleBarMaterial) {
 			return ErrUnsupportedPlatform
 		}
 	}
