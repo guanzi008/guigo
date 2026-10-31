@@ -181,7 +181,7 @@ func (n *nativeWindow) initializeTitleBar() error {
 	if composition == 0 {
 		return errors.New("content title bar requires desktop composition")
 	}
-	if SupportsWindowMaterial(WindowMica) {
+	if SupportsWindowMaterial(WindowMicaAlt) {
 		if err := n.applyWindowBackdrop(); err != nil {
 			return err
 		}

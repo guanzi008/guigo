@@ -25,7 +25,7 @@ import (
 // 入参: material 窗口材质
 // 返回: bool 是否支持
 func SupportsWindowMaterial(material WindowMaterial) bool {
-	return material == WindowSolid || (material == WindowMica || material == WindowAcrylic) && windows.RtlGetVersion().BuildNumber >= 22621
+	return material == WindowSolid || (material == WindowMicaAlt || material == WindowAcrylic) && windows.RtlGetVersion().BuildNumber >= 22621
 }
 
 // setWindowMaterial 在宿主线程切换材质，失败时恢复当前窗口外观
@@ -52,7 +52,7 @@ func (n *nativeWindow) setWindowMaterial(material WindowMaterial) error {
 func (n *nativeWindow) applyWindowBackdrop() error {
 	material := uint32(1)
 	switch n.options.WindowMaterial {
-	case WindowMica:
+	case WindowMicaAlt:
 		material = 4
 	case WindowAcrylic:
 		material = 3
