@@ -68,6 +68,21 @@ static void guigo_filter_pattern(GtkFileFilter *filter, char *pattern, char *cur
     *cursor = original;
 }
 
+static void guigo_filter_mime(GtkFileFilter *filter, const char *pattern) {
+    if (!g_str_has_prefix(pattern, "*.") || !pattern[2]) return;
+    for (const char *cursor = pattern + 2; *cursor; cursor++)
+        if (!g_ascii_isalnum(*cursor)) return;
+    gboolean uncertain = FALSE;
+    char *type = g_content_type_guess(pattern, NULL, 0, &uncertain);
+    // UKUI's portal needs MIME rules alongside extension globs.
+    if (type && !uncertain && !g_content_type_is_unknown(type)) {
+        char *mime = g_content_type_get_mime_type(type);
+        if (mime) gtk_file_filter_add_mime_type(filter, mime);
+        g_free(mime);
+    }
+    g_free(type);
+}
+
 static GtkFileFilter *guigo_file_filter_new(const char *name, const char *value) {
     GtkFileFilter *filter = gtk_file_filter_new();
     gtk_file_filter_set_name(filter, name);
@@ -76,6 +91,7 @@ static GtkFileFilter *guigo_file_filter_new(const char *name, const char *value)
         char *pattern = g_strstrip(patterns[i]);
         if (!pattern[0]) continue;
         if (strcmp(pattern, "*.*") == 0) pattern = "*";
+        guigo_filter_mime(filter, pattern);
         unsigned letters = 0;
         for (char *cursor = pattern; *cursor; cursor++) if (g_ascii_isalpha(*cursor)) letters++;
         if (letters <= 8) guigo_filter_pattern(filter, pattern, pattern);
