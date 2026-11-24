@@ -10,6 +10,8 @@ extern int guigo3CanClose(void);
 extern void guigo3Ready(void);
 extern void guigo3TitleChanged(int active, int maximized);
 extern void guigo3DialogFinished(unsigned long long id, int status, char **paths, int count);
+extern int guigo3AllowNavigation(const char *uri, int new_window, int user_gesture);
+extern void guigo3NavigationStarted(void);
 
 typedef void *(*manager_new_fn)(void);
 typedef void *(*view_with_manager_fn)(void *);
@@ -18,6 +20,19 @@ typedef void (*add_script_fn)(void *, void *);
 typedef void (*script_unref_fn)(void *);
 typedef void (*load_uri_fn)(void *, const char *);
 typedef GObject *(*get_settings_fn)(void *);
+typedef void *(*navigation_action_fn)(void *);
+typedef void *(*navigation_request_fn)(void *);
+typedef const char *(*request_uri_fn)(void *);
+typedef gboolean (*navigation_gesture_fn)(void *);
+typedef void (*policy_ignore_fn)(void *);
+
+typedef struct {
+    navigation_action_fn action;
+    navigation_request_fn request;
+    request_uri_fn uri;
+    navigation_gesture_fn gesture;
+    policy_ignore_fn ignore;
+} GuigoNavigation;
 
 static GtkWidget *guigo_window;
 static GtkWidget *guigo_overlay;
@@ -25,6 +40,8 @@ static GtkWidget *guigo_drag;
 static GtkCssProvider *guigo_caption_style;
 static GdkRectangle guigo_drag_rect;
 static gpointer guigo_main_thread;
+static GtkNativeDialog *guigo_active_dialog;
+static unsigned long long guigo_active_dialog_id;
 
 static const char *guigo_default_caption_css =
     ".guigo-controls button { border:0; border-radius:0; }";
@@ -108,6 +125,28 @@ static GtkFileFilter *guigo_file_filter_new(const char *name, const char *value)
     return filter;
 }
 
+static void guigo_dialog_response(GtkNativeDialog *dialog, gint response, gpointer data) {
+    if (dialog != guigo_active_dialog) return;
+    unsigned long long id = guigo_active_dialog_id;
+    guigo_active_dialog = NULL;
+    guigo_active_dialog_id = 0;
+    char **paths = NULL;
+    int count = 0;
+    if (response == GTK_RESPONSE_ACCEPT) {
+        GSList *selected = gtk_file_chooser_get_filenames(GTK_FILE_CHOOSER(dialog));
+        count = (int)g_slist_length(selected);
+        paths = g_new0(char *, count);
+        int i = 0;
+        for (GSList *item = selected; item; item = item->next) paths[i++] = item->data;
+        g_slist_free(selected);
+    }
+    guigo3DialogFinished(id, count > 0, paths, count);
+    for (int i = 0; i < count; i++) g_free(paths[i]);
+    g_free(paths);
+    gtk_native_dialog_destroy(dialog);
+    g_object_unref(dialog);
+}
+
 static gboolean guigo_dialog_idle(gpointer data) {
     GuigoDialogRequest *request = data;
     if (!guigo_window) {
@@ -162,26 +201,25 @@ static gboolean guigo_dialog_idle(gpointer data) {
         gtk_file_filter_add_pattern(all, "*");
         gtk_file_chooser_add_filter(chooser, all);
     }
-    char **paths = NULL;
-    int count = 0;
-    int status = 0;
-    if (gtk_native_dialog_run(GTK_NATIVE_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
-        GSList *selected = gtk_file_chooser_get_filenames(chooser);
-        count = (int)g_slist_length(selected);
-        if (count > 0) {
-            paths = g_new0(char *, count);
-            int i = 0;
-            for (GSList *item = selected; item; item = item->next)
-                paths[i++] = item->data;
-            status = 1;
-        }
-        g_slist_free(selected);
-    }
-    guigo3DialogFinished(request->id, status, paths, count);
-    for (int i = 0; i < count; i++) g_free(paths[i]);
-    g_free(paths);
-    g_object_unref(dialog);
+    guigo_active_dialog = GTK_NATIVE_DIALOG(dialog);
+    guigo_active_dialog_id = request->id;
+    g_signal_connect(dialog, "response", G_CALLBACK(guigo_dialog_response), NULL);
+    gtk_native_dialog_show(guigo_active_dialog);
     return G_SOURCE_REMOVE;
+}
+
+static gboolean guigo_dialog_cancel_idle(gpointer data) {
+    unsigned long long id = *(unsigned long long *)data;
+    if (guigo_active_dialog && guigo_active_dialog_id == id)
+        guigo_dialog_response(guigo_active_dialog, GTK_RESPONSE_CANCEL, NULL);
+    return G_SOURCE_REMOVE;
+}
+
+void guigo3DialogCancel(unsigned long long id) {
+    if (!g_atomic_pointer_get(&guigo_main_thread)) return;
+    unsigned long long *value = g_new(unsigned long long, 1);
+    *value = id;
+    g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, guigo_dialog_cancel_idle, value, g_free);
 }
 
 int guigo3DialogStart(unsigned long long id, int mode, const char *title,
@@ -219,7 +257,24 @@ static gboolean guigo_delete(GtkWidget *widget, GdkEvent *event, gpointer data) 
 
 static void guigo_destroy(GtkWidget *widget, gpointer data) {
     guigo_window = NULL;
+    if (guigo_active_dialog)
+        guigo_dialog_response(guigo_active_dialog, GTK_RESPONSE_CANCEL, NULL);
     gtk_main_quit();
+}
+
+static gboolean guigo_navigation_policy(GtkWidget *view, void *decision, int kind, gpointer data) {
+    if (kind != 0 && kind != 1) return FALSE;
+    GuigoNavigation *navigation = data;
+    void *action = navigation->action(decision);
+    void *request = action ? navigation->request(action) : NULL;
+    const char *uri = request ? navigation->uri(request) : NULL;
+    if (uri && guigo3AllowNavigation(uri, kind == 1, navigation->gesture(action))) return FALSE;
+    navigation->ignore(decision);
+    return TRUE;
+}
+
+static void guigo_load_changed(GtkWidget *view, int event, gpointer data) {
+    if (event == 0) guigo3NavigationStarted();
 }
 
 static void guigo_notify(GtkWidget *widget, gpointer data) {
@@ -414,7 +469,15 @@ int guigo3Run(const char *url, const char *script, const char *title,
     script_unref_fn script_unref = (script_unref_fn)dlsym(webkit, "webkit_user_script_unref");
     load_uri_fn load_uri = (load_uri_fn)dlsym(webkit, "webkit_web_view_load_uri");
     get_settings_fn get_settings = (get_settings_fn)dlsym(webkit, "webkit_web_view_get_settings");
+    GuigoNavigation navigation = {
+        .action = (navigation_action_fn)dlsym(webkit, "webkit_navigation_policy_decision_get_navigation_action"),
+        .request = (navigation_request_fn)dlsym(webkit, "webkit_navigation_action_get_request"),
+        .uri = (request_uri_fn)dlsym(webkit, "webkit_uri_request_get_uri"),
+        .gesture = (navigation_gesture_fn)dlsym(webkit, "webkit_navigation_action_is_user_gesture"),
+        .ignore = (policy_ignore_fn)dlsym(webkit, "webkit_policy_decision_ignore"),
+    };
     if (!manager_new || !view_new || !script_new || !add_script || !script_unref ||
+        !navigation.action || !navigation.request || !navigation.uri || !navigation.gesture || !navigation.ignore ||
         !load_uri || !gtk_init_check(NULL, NULL)) {
         dlclose(webkit);
         return 2;
@@ -427,9 +490,12 @@ int guigo3Run(const char *url, const char *script, const char *title,
     GtkWidget *view = GTK_WIDGET(view_new(manager));
     g_object_unref(manager);
     if (!view) {
+        g_atomic_pointer_set(&guigo_main_thread, NULL);
         dlclose(webkit);
         return 3;
     }
+    g_signal_connect(view, "decide-policy", G_CALLBACK(guigo_navigation_policy), &navigation);
+    g_signal_connect(view, "load-changed", G_CALLBACK(guigo_load_changed), NULL);
     GObject *settings = get_settings ? get_settings(view) : NULL;
     if (settings) {
         if (g_object_class_find_property(G_OBJECT_GET_CLASS(settings), "enable-smooth-scrolling"))

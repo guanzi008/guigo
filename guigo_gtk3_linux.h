@@ -11,6 +11,7 @@ void guigo3Hide(void);
 int guigo3DialogStart(unsigned long long id, int mode, const char *title,
                       const char *default_path, const char *default_name,
                       char **filter_names, char **filter_patterns, int filter_count);
+void guigo3DialogCancel(unsigned long long id);
 void guigo3SetTitle(const char *title);
 void guigo3SetTitleBarColors(const char *colors);
 void guigo3SetSize(int width, int height);

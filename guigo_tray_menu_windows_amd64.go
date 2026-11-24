@@ -31,7 +31,7 @@ type menuItemInfo struct {
 	Bitmap                            uintptr
 }
 
-// createTrayMenu 创建原生菜单树，由调用方销毁返回的根菜单
+// createTrayMenu 创建原生菜单树，由调用方销毁返回的根菜单，空子菜单不附加原生句柄
 // 入参: items 菜单项, commands 命令与菜单项映射, disabled 祖先是否禁用
 // 返回: uintptr 根菜单, error 创建错误
 func createTrayMenu(items []TrayItem, commands map[uint32]TrayItem, disabled bool) (uintptr, error) {
@@ -59,11 +59,18 @@ func createTrayMenu(items []TrayItem, commands map[uint32]TrayItem, disabled boo
 		if item.Separator {
 			info.Type |= 0x800
 		} else if len(item.Children) != 0 {
-			info.Mask |= 4
-			info.SubMenu, err = createTrayMenu(item.Children, commands, item.Disabled)
-			if err != nil {
+			subMenu, subErr := createTrayMenu(item.Children, commands, item.Disabled)
+			if subErr != nil {
 				user32.NewProc("DestroyMenu").Call(menu)
-				return 0, err
+				return 0, subErr
+			}
+			count, _, _ := user32.NewProc("GetMenuItemCount").Call(subMenu)
+			if int32(count) <= 0 {
+				user32.NewProc("DestroyMenu").Call(subMenu)
+				info.State |= 3
+			} else {
+				info.Mask |= 4
+				info.SubMenu = subMenu
 			}
 		} else {
 			info.ID = uint32(len(commands) + 1)
@@ -87,7 +94,7 @@ func createTrayMenu(items []TrayItem, commands map[uint32]TrayItem, disabled boo
 // 返回: error 菜单创建错误
 func (t *windowsTray) showMenu(position uintptr) error {
 	n := t.owner
-	if n.trays[t.data.ID] != t || n.ctx.Err() != nil || n.activeTrayMenu != nil {
+	if n.trays[t.data.ID] != t || n.ctx.Err() != nil || n.closed || n.quitting || n.activeTrayMenu != nil {
 		return nil
 	}
 	options, revision := t.options, t.revision
@@ -98,7 +105,7 @@ func (t *windowsTray) showMenu(position uintptr) error {
 	}
 	defer user32.NewProc("DestroyMenu").Call(menu)
 	count, _, _ := user32.NewProc("GetMenuItemCount").Call(menu)
-	if count == 0 {
+	if int32(count) <= 0 {
 		return nil
 	}
 	cursor := point{X: int32(int16(position)), Y: int32(int16(position >> 16))}
@@ -119,7 +126,11 @@ func (t *windowsTray) showMenu(position uintptr) error {
 		}
 	}
 	n.activeTrayMenu = t
-	defer func() { n.activeTrayMenu = nil }()
+	n.modalActive++
+	defer func() {
+		n.activeTrayMenu = nil
+		n.leaveModal()
+	}()
 	flags := uintptr(0x182)
 	if alignment, _, _ := user32.NewProc("GetSystemMetrics").Call(40); alignment != 0 {
 		flags |= 8
@@ -127,9 +138,11 @@ func (t *windowsTray) showMenu(position uintptr) error {
 	user32.NewProc("SetForegroundWindow").Call(n.hwnd)
 	selected, _, _ := user32.NewProc("TrackPopupMenu").Call(menu, flags, uintptr(cursor.X), uintptr(cursor.Y), 0, n.hwnd, 0)
 	user32.NewProc("PostMessageW").Call(n.hwnd, 0, 0, 0)
-	if n.trays[t.data.ID] == t && revision == t.revision && n.ctx.Err() == nil {
+	if n.trays[t.data.ID] == t && revision == t.revision && n.ctx.Err() == nil && !n.closed && !n.quitting {
 		if item, ok := commands[uint32(selected)]; ok && !item.Disabled && options.OnSelect != nil {
-			go options.OnSelect(item.ID)
+			onSelect := options.OnSelect
+			id := item.ID
+			t.runTrayCallback(func() { onSelect(id) })
 		}
 		shell32.NewProc("Shell_NotifyIconW").Call(3, uintptr(unsafe.Pointer(&t.data)))
 	}

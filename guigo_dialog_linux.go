@@ -17,17 +17,24 @@
 package guigo
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"unsafe"
 )
+
+// linuxDialogIDs 为原生异步对话框分配进程级递增标识
+var linuxDialogIDs atomic.Uint64
 
 // linuxDialog 保存异步对话框状态
 type linuxDialog struct {
 	object, cancel uintptr
 	mode           int
+	ctx            context.Context
+	stop           func() bool
 	result         chan linuxDialogResult
 }
 
@@ -35,111 +42,6 @@ type linuxDialog struct {
 type linuxDialogResult struct {
 	paths []string
 	err   error
-}
-
-// dialog 选择单个文件或目录
-// 入参: o 对话框选项, mode 对话框类型
-// 返回: string 文件路径, error 对话框错误
-func (n *nativeWindow) dialog(o DialogOptions, mode int) (string, error) {
-	paths, err := n.dialogs(o, mode)
-	if err != nil {
-		return "", err
-	}
-	if len(paths) == 0 {
-		return "", ErrCanceled
-	}
-	return paths[0], nil
-}
-
-// dialogs 在GTK线程显示异步文件对话框并等待结果
-// 入参: o 对话框选项, mode 对话框类型
-// 返回: []string 文件路径, error 对话框错误
-func (n *nativeWindow) dialogs(o DialogOptions, mode int) ([]string, error) {
-	if n.ctx.Err() != nil {
-		return nil, ErrClosed
-	}
-	result := make(chan linuxDialogResult, 1)
-	err := n.enqueue(func() {
-		if n.ctx.Err() != nil {
-			result <- linuxDialogResult{err: ErrClosed}
-			return
-		}
-		n.nextDialog++
-		id := n.nextDialog
-		dialog := &linuxDialog{object: gtk.DialogNew(), cancel: gtk.CancelNew(), mode: mode, result: result}
-		n.dialogsPending[id] = dialog
-		gtk.DialogModal(dialog.object, true)
-		if o.Title != "" {
-			gtk.DialogTitle(dialog.object, o.Title)
-		}
-		if o.DefaultPath != "" {
-			path, err := filepath.Abs(o.DefaultPath)
-			if err != nil {
-				n.finishDialog(id, nil, err)
-				return
-			}
-			file := gtk.FileNew(path)
-			info, err := os.Stat(path)
-			if err == nil && info.IsDir() {
-				gtk.DialogFolder(dialog.object, file)
-			} else if mode == 1 {
-				parent := gtk.FileNew(filepath.Dir(path))
-				gtk.DialogFolder(dialog.object, parent)
-				gtk.Unref(parent)
-				if o.DefaultName == "" {
-					gtk.DialogName(dialog.object, filepath.Base(path))
-				}
-			} else {
-				gtk.DialogFile(dialog.object, file)
-			}
-			gtk.Unref(file)
-		}
-		if o.DefaultName != "" && mode != 2 {
-			gtk.DialogName(dialog.object, o.DefaultName)
-		}
-		if len(o.Filters) > 0 && mode != 2 {
-			list := gtk.ListNew(gtk.FilterType())
-			for _, f := range o.Filters {
-				filter := gtk.FilterNew()
-				gtk.FilterName(filter, f.Name)
-				for _, pattern := range strings.Split(f.Pattern, ";") {
-					if pattern = strings.TrimSpace(pattern); pattern != "" {
-						gtk.FilterPattern(filter, pattern)
-					}
-				}
-				gtk.ListAppend(list, filter)
-				gtk.Unref(filter)
-			}
-			gtk.DialogFilters(dialog.object, list)
-			gtk.Unref(list)
-		}
-		launch := gtk.DialogOpen
-		switch mode {
-		case 1:
-			launch = gtk.DialogSave
-		case 2:
-			launch = gtk.DialogDirectory
-		case 3:
-			launch = gtk.DialogMultiple
-		}
-		if n.ctx.Err() != nil {
-			n.finishDialog(id, nil, ErrClosed)
-			return
-		}
-		launch(dialog.object, n.window, dialog.cancel, linuxCallbacks.dialog, id)
-	})
-	if err != nil {
-		return nil, err
-	}
-	select {
-	case value := <-result:
-		if n.ctx.Err() != nil {
-			return nil, ErrClosed
-		}
-		return value.paths, value.err
-	case <-n.done:
-		return nil, ErrClosed
-	}
 }
 
 // linuxDialogFinished 完成原生异步对话框并读取本地路径
@@ -172,7 +74,9 @@ func linuxDialogFinished(object, result, id uintptr) {
 			canceled = domain == gtk.DialogErrorQuark() && (code == 1 || code == 2) || domain == gtk.IOErrorQuark() && code == 19
 		}
 		err := nativeError(nativeErr)
-		if n.ctx.Err() != nil {
+		if dialog.ctx.Err() != nil {
+			err = dialog.ctx.Err()
+		} else if n.ctx.Err() != nil {
 			err = ErrClosed
 		} else if err == nil || canceled {
 			err = ErrCanceled
@@ -181,6 +85,10 @@ func linuxDialogFinished(object, result, id uintptr) {
 		return
 	}
 	defer gtk.Unref(value)
+	if err := dialog.ctx.Err(); err != nil {
+		n.finishDialog(id, nil, err)
+		return
+	}
 	if n.ctx.Err() != nil {
 		n.finishDialog(id, nil, ErrClosed)
 		return
@@ -198,7 +106,7 @@ func linuxDialogFinished(object, result, id uintptr) {
 	}
 	if dialog.mode == 3 {
 		count := gtk.ListCount(value)
-		for i := uint32(0); i < count; i++ {
+		for i := uint32(0); i < count && err == nil; i++ {
 			file := gtk.ListItem(value, i)
 			appendFile(file)
 			gtk.Unref(file)
@@ -206,10 +114,201 @@ func linuxDialogFinished(object, result, id uintptr) {
 	} else {
 		appendFile(value)
 	}
-	if len(paths) == 0 && err == nil {
+	if err != nil {
+		paths = nil
+	} else if len(paths) == 0 {
 		err = ErrCanceled
 	}
 	n.finishDialog(id, paths, err)
+}
+
+// linuxExistingDir 沿路径向上查找首个存在的目录
+// 入参: path 起始绝对路径
+// 返回: string 已存在的目录路径，未找到返回空字符串
+func linuxExistingDir(path string) string {
+	current := filepath.Clean(path)
+	for {
+		if info, err := os.Stat(current); err == nil && info.IsDir() {
+			return current
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return ""
+		}
+		current = parent
+	}
+}
+
+// linuxFilterSuffix 提取简单通配符模式中的文件扩展名后缀
+// 入参: pattern 单个通配符模式
+// 返回: string 扩展名后缀, bool 是否为简单扩展名模式
+func linuxFilterSuffix(pattern string) (string, bool) {
+	suffix, ok := strings.CutPrefix(pattern, "*.")
+	if !ok || suffix == "" || strings.ContainsAny(suffix, "*?[]/\\.") {
+		return "", false
+	}
+	return suffix, true
+}
+
+// dialog 选择单个文件或目录
+// 入参: ctx 调用上下文, o 对话框选项, mode 对话框类型
+// 返回: string 文件路径, error 对话框错误
+func (n *nativeWindow) dialog(ctx context.Context, o DialogOptions, mode int) (string, error) {
+	paths, err := n.dialogs(ctx, o, mode)
+	if err != nil {
+		return "", err
+	}
+	if len(paths) == 0 {
+		return "", ErrCanceled
+	}
+	return paths[0], nil
+}
+
+// dialogs 在GTK线程显示异步文件对话框，限制单窗口并发并响应上下文取消
+// 入参: ctx 调用上下文, o 对话框选项, mode 对话框类型
+// 返回: []string 文件路径, error 对话框错误
+func (n *nativeWindow) dialogs(ctx context.Context, o DialogOptions, mode int) ([]string, error) {
+	if n.isClosed() || n.ctx.Err() != nil {
+		return nil, ErrClosed
+	}
+	result := make(chan linuxDialogResult, 1)
+	err := n.enqueueCleanup(func() {
+		if err := ctx.Err(); err != nil {
+			result <- linuxDialogResult{err: err}
+			return
+		}
+		if n.ctx.Err() != nil {
+			result <- linuxDialogResult{err: ErrClosed}
+			return
+		}
+		if len(n.dialogsPending) > 0 {
+			result <- linuxDialogResult{err: ErrDialogBusy}
+			return
+		}
+		id := uintptr(linuxDialogIDs.Add(1))
+		dialog := &linuxDialog{object: gtk.DialogNew(), cancel: gtk.CancelNew(), mode: mode, ctx: ctx, result: result}
+		dialog.stop = context.AfterFunc(ctx, func() {
+			_ = n.enqueue(func() {
+				if activeDialog := n.dialogsPending[id]; activeDialog == dialog {
+					gtk.Cancel(activeDialog.cancel)
+				}
+			})
+		})
+		n.dialogsPending[id] = dialog
+		gtk.DialogModal(dialog.object, 1)
+		if o.Title != "" {
+			gtk.DialogTitle(dialog.object, o.Title)
+		}
+		if o.DefaultPath != "" {
+			path, err := filepath.Abs(o.DefaultPath)
+			if err != nil {
+				n.finishDialog(id, nil, err)
+				return
+			}
+			info, statErr := os.Stat(path)
+			if mode == 2 {
+				if dir := linuxExistingDir(path); dir != "" {
+					folder := gtk.FileNew(dir)
+					gtk.DialogFolder(dialog.object, folder)
+					gtk.Unref(folder)
+				}
+			} else if statErr == nil && info.IsDir() {
+				folder := gtk.FileNew(path)
+				gtk.DialogFolder(dialog.object, folder)
+				gtk.Unref(folder)
+			} else if mode == 1 {
+				if dir := linuxExistingDir(filepath.Dir(path)); dir != "" {
+					parent := gtk.FileNew(dir)
+					gtk.DialogFolder(dialog.object, parent)
+					gtk.Unref(parent)
+				}
+				if o.DefaultName == "" {
+					gtk.DialogName(dialog.object, filepath.Base(path))
+				}
+			} else {
+				file := gtk.FileNew(path)
+				gtk.DialogFile(dialog.object, file)
+				gtk.Unref(file)
+			}
+		}
+		if o.DefaultName != "" && mode != 2 {
+			gtk.DialogName(dialog.object, o.DefaultName)
+		}
+		if len(o.Filters) > 0 && mode != 2 {
+			list := gtk.ListNew(gtk.FilterType())
+			var firstFilter uintptr
+			for _, f := range o.Filters {
+				filter := gtk.FilterNew()
+				added := 0
+				for _, pattern := range strings.Split(f.Pattern, ";") {
+					if pattern = strings.TrimSpace(pattern); pattern == "" {
+						continue
+					}
+					if suffix, ok := linuxFilterSuffix(pattern); ok && gtk.FilterSuffix != nil {
+						gtk.FilterSuffix(filter, suffix)
+					} else {
+						gtk.FilterPattern(filter, pattern)
+					}
+					added++
+				}
+				if added == 0 {
+					gtk.Unref(filter)
+					continue
+				}
+				if f.Name != "" {
+					gtk.FilterName(filter, f.Name)
+				}
+				gtk.ListAppend(list, filter)
+				if firstFilter == 0 {
+					firstFilter = gtk.Ref(filter)
+				}
+				gtk.Unref(filter)
+			}
+			if firstFilter != 0 {
+				gtk.DialogFilters(dialog.object, list)
+				if gtk.DialogDefaultFilter != nil {
+					gtk.DialogDefaultFilter(dialog.object, firstFilter)
+				}
+				gtk.Unref(firstFilter)
+			}
+			gtk.Unref(list)
+		}
+		launch := gtk.DialogOpen
+		switch mode {
+		case 1:
+			launch = gtk.DialogSave
+		case 2:
+			launch = gtk.DialogDirectory
+		case 3:
+			launch = gtk.DialogMultiple
+		}
+		if err := ctx.Err(); err != nil {
+			n.finishDialog(id, nil, err)
+			return
+		}
+		if n.ctx.Err() != nil {
+			n.finishDialog(id, nil, ErrClosed)
+			return
+		}
+		launch(dialog.object, n.window, dialog.cancel, linuxCallbacks.dialog, id)
+	}, func() { result <- linuxDialogResult{err: ErrClosed} })
+	if err != nil {
+		return nil, err
+	}
+	select {
+	case value := <-result:
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if n.ctx.Err() != nil {
+			return nil, ErrClosed
+		}
+		return value.paths, value.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-n.done:
+		return nil, ErrClosed
+	}
 }
 
 // finishDialog 回收对话框资源并通知等待方
@@ -220,10 +319,16 @@ func (n *nativeWindow) finishDialog(id uintptr, paths []string, err error) {
 		return
 	}
 	delete(n.dialogsPending, id)
+	if dialog.stop != nil {
+		dialog.stop()
+	}
 	gtk.Unref(dialog.object)
 	gtk.Unref(dialog.cancel)
-	dialog.result <- linuxDialogResult{paths: paths, err: err}
-	if n.ctx.Err() != nil && len(n.dialogsPending) == 0 {
+	select {
+	case dialog.result <- linuxDialogResult{paths: paths, err: err}:
+	default:
+	}
+	if n.closed && len(n.dialogsPending) == 0 {
 		n.shutdown()
 	}
 }

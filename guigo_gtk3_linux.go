@@ -13,7 +13,6 @@ import "C"
 import (
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,77 +23,56 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
 )
 
-const guigo3Bridge = `(() => {
-	if (window !== window.top || location.origin !== __GUIGO_ORIGIN__) return;
-	const token = __GUIGO_TOKEN__;
-	const listeners = new Map();
-	const pending = new Set();
-	const events = new EventSource("/__guigo/events?token=" + encodeURIComponent(token));
+// guigo3Script 通过本机 HTTP 和 SSE 接入共用的 GUIGo 调用桥。
+func guigo3Script(origin, token string) string {
+	return `(() => {
+	if (window !== window.top || location.origin !== ` + bridgeScriptQuoted(origin) + `) return;
+	const bridgeToken = ` + bridgeScriptQuoted(token) + `;
+	const dropEnabled = false;
+	const reportError = error => console.error(error);
+	const events = new EventSource("/__guigo/events?token=" + encodeURIComponent(bridgeToken));
 	const connected = new Promise(resolve => events.addEventListener("open", resolve, {once:true}));
-	events.onmessage = ({data}) => {
-		const message = JSON.parse(data);
-		if (message.type !== "event") return;
-		for (const listener of [...(listeners.get(message.name) || [])]) {
-			try { listener(message.value); } catch (error) { console.error(error); }
+	const listeners = new EventTarget();
+	const receive = data => listeners.dispatchEvent(new MessageEvent("message", {data}));
+	events.onmessage = event => receive(JSON.parse(event.data));
+	const requests = new Map();
+	const transport = {
+		addEventListener: (...args) => listeners.addEventListener(...args),
+		postMessage(message) {
+			if (message.type === "cancel") requests.get(message.id)?.abort();
+			const controller = message.type === "call" ? new AbortController() : null;
+			if (controller) requests.set(message.id, controller);
+			connected.then(async () => {
+				if (controller?.signal.aborted) return;
+				const response = await fetch("/__guigo/message", {
+					method: "POST",
+					headers: {"Content-Type": "application/json", "X-Guigo-Token": bridgeToken},
+					signal: controller?.signal,
+					body: JSON.stringify(message)
+				});
+				if (!response.ok) throw new Error("GUIGo request failed (" + response.status + ")");
+				if (message.type === "call") receive(await response.json());
+			}).catch(error => {
+				if (message.type === "call") receive({type:"reply", id:message.id, error:error.message});
+			}).finally(() => {
+				if (controller) requests.delete(message.id);
+			});
 		}
 	};
-	async function encode(value) {
-		if (value instanceof Blob || value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
-			const bytes = value instanceof Blob ? new Uint8Array(await value.arrayBuffer()) :
-				value instanceof ArrayBuffer ? new Uint8Array(value) :
-				new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-			let binary = "";
-			for (let offset = 0; offset < bytes.length; offset += 16384)
-				binary += String.fromCharCode(...bytes.subarray(offset, offset + 16384));
-			return {__guigoBytes:btoa(binary)};
-		}
-		if (value && typeof value.toJSON === "function") return encode(value.toJSON());
-		if (Array.isArray(value)) return Promise.all(value.map(encode));
-		if (value && typeof value === "object")
-			return Object.fromEntries(await Promise.all(Object.entries(value).map(async ([key, item]) => [key, await encode(item)])));
-		return value;
-	}
-	Object.defineProperty(window, "guigo", {value:Object.freeze({
-		on(name, listener) {
-			let group = listeners.get(name);
-			if (!group) listeners.set(name, group = new Set());
-			group.add(listener);
-			return () => { group.delete(listener); if (!group.size) listeners.delete(name); };
-		},
-		async call(name, args = {}, options = {}) {
-			await connected;
-			options.signal?.throwIfAborted();
-			const response = await fetch("/__guigo/call", {
-				method:"POST",
-				headers:{"Content-Type":"application/json", "X-Guigo-Token":token},
-				body:JSON.stringify({name, args:await encode(args)}),
-				signal:options.signal
-			});
-			if (!response.ok) throw new Error("GUIGo request failed (" + response.status + ")");
-			const result = await response.json();
-			if (!result.ok) {
-				const error = new Error(result.error);
-				error.name = result.errorName || "Error";
-				if (result.code) error.code = result.code;
-				throw error;
-			}
-			return result.value;
-		}
-	}), configurable:false});
 	addEventListener("pagehide", () => events.close(), {once:true});
+` + bridgeScriptCore + `
 })();`
+}
 
 var guigo3Active atomic.Pointer[nativeWindow]
 
-// SupportsWindowMaterial 查询当前GTK窗口支持的材质。
-func SupportsWindowMaterial(material WindowMaterial) bool {
+func supportsWindowMaterial(material WindowMaterial) bool {
 	return material == WindowSolid
 }
 
@@ -103,7 +81,8 @@ type nativeWindow struct {
 	origin         string
 	token          string
 	pageCtx        context.Context
-	cancel         context.CancelFunc
+	calls          atomic.Pointer[callQueue]
+	pageCancel     context.CancelFunc
 	closed         atomic.Bool
 	infoMu         sync.Mutex
 	info           TitleBarInfo
@@ -124,14 +103,14 @@ func run(parent context.Context, options Options) error {
 		options: options,
 		token:   rand.Text(),
 		pageCtx: ctx,
-		cancel:  cancel,
 		peers:   make(map[chan string]struct{}),
 	}
+	n.resetPage()
 	if options.TitleBar == TitleBarContent {
-		n.info = TitleBarInfo{Height: 36, Right: 108, Colors: options.TitleBarColors}
+		n.info = TitleBarInfo{Height: 36, Right: 108, Colors: options.TitleBarColors, Material: WindowSolid}
 	}
 	if !guigo3Active.CompareAndSwap(nil, n) {
-		return errors.New("another Run is active")
+		return ErrAlreadyRunning
 	}
 	defer guigo3Active.Store(nil)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -139,7 +118,7 @@ func run(parent context.Context, options Options) error {
 		return err
 	}
 	n.origin = "http://" + listener.Addr().String()
-	server := &http.Server{Handler: n.handler()}
+	server := &http.Server{Handler: n.handler(), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) && options.OnError != nil {
 			options.OnError(err)
@@ -148,9 +127,7 @@ func run(parent context.Context, options Options) error {
 	defer server.Close()
 	url := cString(resourceAddress(n.origin, options.EntryPath))
 	defer C.free(unsafe.Pointer(url))
-	bridge := strings.ReplaceAll(guigo3Bridge, "__GUIGO_ORIGIN__", strconv.Quote(n.origin))
-	bridge = strings.ReplaceAll(bridge, "__GUIGO_TOKEN__", strconv.Quote(n.token))
-	script := cString(bridge)
+	script := cString(guigo3Script(n.origin, n.token))
 	defer C.free(unsafe.Pointer(script))
 	title := cString(options.Title)
 	defer C.free(unsafe.Pointer(title))
@@ -174,11 +151,12 @@ func run(parent context.Context, options Options) error {
 		colors, icon, C.int(len(iconData)))
 	runtime.KeepAlive(iconData)
 	n.closed.Store(true)
+	cancel()
 	if options.OnClose != nil {
 		options.OnClose()
 	}
 	if code != 0 {
-		return fmt.Errorf("GTK 3 / WebKit2GTK startup failed (%d)", int(code))
+		return fmt.Errorf("%w: GTK 3 / WebKit2GTK (%d)", ErrRuntimeUnavailable, int(code))
 	}
 	return parent.Err()
 }
@@ -192,6 +170,15 @@ func cBool(value bool) C.int {
 
 func cString(value string) *C.char { return C.CString(value) }
 
+func (n *nativeWindow) resetPage() {
+	if n.pageCancel != nil {
+		n.pageCancel()
+	}
+	ctx, cancel := context.WithCancel(n.pageCtx)
+	n.pageCancel = cancel
+	n.calls.Store(newCallQueue(ctx))
+}
+
 func titlebarCSS(colors TitleBarColors) string {
 	if colors == (TitleBarColors{}) {
 		return ""
@@ -203,33 +190,52 @@ func titlebarCSS(colors TitleBarColors) string {
 
 func (n *nativeWindow) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if "http://"+r.Host != n.origin || (r.Header.Get("Origin") != "" && r.Header.Get("Origin") != n.origin) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		switch r.URL.Path {
 		case "/__guigo/events":
 			n.serveEvents(w, r)
 			return
 		case "/__guigo/call":
-			n.serveCall(w, r)
+			n.serveBinaryCall(w, r)
+			return
+		case "/__guigo/message":
+			n.serveMessage(w, r)
+			return
+		}
+		if isReservedPath(r.URL.Path) {
+			http.NotFound(w, r)
 			return
 		}
 		if n.options.ResourceHandler != nil {
 			resource, err := n.options.ResourceHandler(r)
+			if resource != nil && resource.Body != nil {
+				defer resource.Body.Close()
+			}
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
 			if resource != nil {
-				defer resource.Body.Close()
+				status := resource.StatusCode
+				if status == 0 {
+					status = http.StatusOK
+				}
+				if resource.Body == nil && status != http.StatusNoContent && status != http.StatusNotModified {
+					http.Error(w, "missing response body", http.StatusInternalServerError)
+					return
+				}
 				for key, values := range resource.Header {
 					for _, value := range values {
 						w.Header().Add(key, value)
 					}
 				}
-				status := resource.StatusCode
-				if status == 0 {
-					status = http.StatusOK
-				}
 				w.WriteHeader(status)
-				if r.Method != http.MethodHead {
+				if resource.Body != nil && r.Method != http.MethodHead {
 					_, _ = io.Copy(w, resource.Body)
 				}
 				return
@@ -260,11 +266,12 @@ func (n *nativeWindow) serveEvents(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 	tick := time.NewTicker(20 * time.Second)
 	defer tick.Stop()
+	page := n.calls.Load().ctx
 	for {
 		select {
 		case <-r.Context().Done():
 			return
-		case <-n.pageCtx.Done():
+		case <-page.Done():
 			return
 		case message := <-peer:
 			_, _ = fmt.Fprintf(w, "data: %s\n\n", message)
@@ -276,68 +283,81 @@ func (n *nativeWindow) serveEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (n *nativeWindow) serveCall(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost || r.Header.Get("X-Guigo-Token") != n.token {
-		http.Error(w, "forbidden", http.StatusForbidden)
+func (n *nativeWindow) serveMessage(w http.ResponseWriter, r *http.Request) {
+	if !n.authorizedCall(w, r) {
 		return
 	}
-	var request struct {
-		Name string `json:"name"`
-		Args any    `json:"args"`
-	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128<<20)).Decode(&request); err != nil {
-		http.Error(w, "invalid call", http.StatusBadRequest)
+	var message envelope
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&message); err != nil {
+		http.Error(w, "invalid message", http.StatusBadRequest)
 		return
 	}
-	args, err := guigo3Decode(request.Args)
-	if err != nil {
-		http.Error(w, "invalid arguments", http.StatusBadRequest)
-		return
-	}
-	if args == nil {
-		args = map[string]any{}
-	}
-	ctx := context.WithValue(r.Context(), pageContextKey{}, n.pageCtx)
-	reply := dispatch(ctx, n.options.Bindings, envelope{Type: "call", ID: "1", Name: request.Name, Args: args})
-	response := map[string]any{"ok": reply.Error == "", "value": reply.Value}
-	if reply.Error != "" {
-		response["error"] = reply.Error
-		response["errorName"] = reply.ErrorName
-		response["code"] = reply.Code
-	}
-	if result, ok := reply.Value.(Result); ok {
-		response["value"] = result.Value
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
-	if err := json.NewEncoder(w).Encode(response); err != nil && n.options.OnError != nil {
-		n.options.OnError(err)
+	calls := n.calls.Load()
+	switch message.Type {
+	case "cancel":
+		calls.remove(message.ID)
+		w.WriteHeader(http.StatusNoContent)
+	case "accept":
+		calls.accept(message.ID)
+		w.WriteHeader(http.StatusNoContent)
+	case "call":
+		call, err := calls.add(message)
+		if err != nil {
+			writeGuigo3Reply(w, envelope{Type: "reply", ID: message.ID, Error: err.Error()})
+			return
+		}
+		if message.Binary {
+			if !writeGuigo3Reply(w, envelope{Type: "upload", ID: message.ID}) {
+				calls.remove(message.ID)
+			}
+			return
+		}
+		n.runCall(w, r, calls, call, nil, 0)
+	default:
+		http.Error(w, "invalid message", http.StatusBadRequest)
 	}
 }
 
-func guigo3Decode(value any) (any, error) {
-	switch item := value.(type) {
-	case map[string]any:
-		if raw, ok := item["__guigoBytes"].(string); ok && len(item) == 1 {
-			return base64.StdEncoding.DecodeString(raw)
-		}
-		for key, child := range item {
-			decoded, err := guigo3Decode(child)
-			if err != nil {
-				return nil, err
-			}
-			item[key] = decoded
-		}
-	case []any:
-		for i, child := range item {
-			decoded, err := guigo3Decode(child)
-			if err != nil {
-				return nil, err
-			}
-			item[i] = decoded
-		}
+func (n *nativeWindow) authorizedCall(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodPost || r.Header.Get("X-Guigo-Token") != n.token {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return false
 	}
-	return value, nil
+	return true
+}
+
+func (n *nativeWindow) serveBinaryCall(w http.ResponseWriter, r *http.Request) {
+	if !n.authorizedCall(w, r) {
+		return
+	}
+	size, err := strconv.ParseInt(r.Header.Get("X-Guigo-Length"), 10, 64)
+	if err != nil || size < 4 || size > maxBinaryCallSize || (r.ContentLength >= 0 && r.ContentLength != size) {
+		http.Error(w, "invalid binary size", http.StatusBadRequest)
+		return
+	}
+	calls := n.calls.Load()
+	call := calls.take(r.URL.Query().Get("id"))
+	if call == nil {
+		http.Error(w, "call closed", http.StatusGone)
+		return
+	}
+	n.runCall(w, r, calls, call, http.MaxBytesReader(w, r.Body, size), size)
+}
+
+func (n *nativeWindow) runCall(w http.ResponseWriter, r *http.Request, calls *callQueue, call *pendingCall, body io.Reader, size int64) {
+	stop := context.AfterFunc(r.Context(), func() { calls.remove(call.message.ID) })
+	defer stop()
+	reply := calls.run(call, n.options.Bindings, body, size)
+	if !writeGuigo3Reply(w, reply) {
+		calls.remove(call.message.ID)
+	}
+}
+
+func writeGuigo3Reply(w http.ResponseWriter, reply envelope) bool {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_, err := w.Write(marshalReply(reply))
+	return err == nil
 }
 
 func (n *nativeWindow) emit(raw string) error {
@@ -457,9 +477,12 @@ func (n *nativeWindow) setSize(width, height int) error {
 	return nil
 }
 
-func (n *nativeWindow) dialogs(options DialogOptions, mode int) ([]string, error) {
+func (n *nativeWindow) dialogs(ctx context.Context, options DialogOptions, mode int) ([]string, error) {
 	if n.closed.Load() || n.pageCtx.Err() != nil {
 		return nil, ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if options.DefaultPath != "" {
 		path, err := filepath.Abs(options.DefaultPath)
@@ -470,6 +493,10 @@ func (n *nativeWindow) dialogs(options DialogOptions, mode int) ([]string, error
 	}
 	result := make(chan guigo3DialogResult, 1)
 	n.dialogMu.Lock()
+	if len(n.dialogsPending) > 0 {
+		n.dialogMu.Unlock()
+		return nil, ErrDialogBusy
+	}
 	if n.dialogsPending == nil {
 		n.dialogsPending = make(map[uint64]chan guigo3DialogResult)
 	}
@@ -517,10 +544,11 @@ func (n *nativeWindow) dialogs(options DialogOptions, mode int) ([]string, error
 			return nil, ErrClosed
 		}
 		return value.paths, value.err
+	case <-ctx.Done():
+		C.guigo3DialogCancel(C.ulonglong(id))
+		return nil, ctx.Err()
 	case <-n.pageCtx.Done():
-		n.dialogMu.Lock()
-		delete(n.dialogsPending, id)
-		n.dialogMu.Unlock()
+		C.guigo3DialogCancel(C.ulonglong(id))
 		return nil, ErrClosed
 	}
 }
@@ -530,8 +558,8 @@ type guigo3DialogResult struct {
 	err   error
 }
 
-func (n *nativeWindow) dialog(options DialogOptions, mode int) (string, error) {
-	paths, err := n.dialogs(options, mode)
+func (n *nativeWindow) dialog(ctx context.Context, options DialogOptions, mode int) (string, error) {
+	paths, err := n.dialogs(ctx, options, mode)
 	if err != nil {
 		return "", err
 	}
@@ -569,7 +597,9 @@ func guigo3DialogFinished(id C.ulonglong, status C.int, paths **C.char, count C.
 func (n *nativeWindow) printCapabilities(ctx context.Context) (PrintCapabilities, error) {
 	return PrintCapabilities{}, ctx.Err()
 }
-func (n *nativeWindow) showPrintUI(context.Context, string) error { return ErrPrintUnsupported }
+func (n *nativeWindow) showPrintDialog(context.Context, PrintDialogKind) error {
+	return ErrPrintUnsupported
+}
 func (n *nativeWindow) listPrinters(context.Context) ([]PrinterInfo, error) {
 	return nil, ErrPrintUnsupported
 }
@@ -583,12 +613,8 @@ func (n *nativeWindow) print(context.Context, PrintOptions) (PrintResult, error)
 	return PrintResult{}, ErrPrintUnsupported
 }
 
-func resourceURL(path string) string {
-	n := guigo3Active.Load()
-	if n == nil {
-		return ""
-	}
-	return resourceAddress(n.origin, path)
+func (n *nativeWindow) newTray(context.Context, TrayOptions) (*Tray, error) {
+	return nil, ErrUnsupportedPlatform
 }
 
 func openURL(raw string) error {
@@ -598,6 +624,34 @@ func openURL(raw string) error {
 	}
 	go func() { _ = cmd.Wait() }()
 	return nil
+}
+
+//export guigo3AllowNavigation
+func guigo3AllowNavigation(uri *C.char, newWindow, userGesture C.int) C.int {
+	n := guigo3Active.Load()
+	if n == nil {
+		return 0
+	}
+	raw := C.GoString(uri)
+	local := localResource(n.origin, raw)
+	if newWindow == 0 && local {
+		return 1
+	}
+	if userGesture != 0 && !local && externalURL(raw) {
+		go func() {
+			if err := openURL(raw); err != nil && n.options.OnError != nil {
+				n.options.OnError(err)
+			}
+		}()
+	}
+	return 0
+}
+
+//export guigo3NavigationStarted
+func guigo3NavigationStarted() {
+	if n := guigo3Active.Load(); n != nil {
+		n.resetPage()
+	}
 }
 
 //export guigo3CanClose

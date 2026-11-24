@@ -23,16 +23,17 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
-	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
-var linuxHeaderID atomic.Uint64
-var linuxHeaderTargets sync.Map
+// linuxHeaderTarget 保存GTK线程同步遍历请求头时的目标头映射
+var linuxHeaderTarget http.Header
 
 // linuxInput 持有原生请求流及取消标识
 type linuxInput struct {
@@ -55,12 +56,183 @@ type linuxWriter struct {
 	stop    func() bool
 }
 
+// isLinuxPeerCanceled 判断写端错误是否来自WebKit取消单个请求关闭读端
+// 入参: err 写入错误
+// 返回: bool 是否为对端取消
+func isLinuxPeerCanceled(err error) bool {
+	return errors.Is(err, unix.EPIPE) || errors.Is(err, os.ErrClosed) || errors.Is(err, io.ErrClosedPipe)
+}
+
 // linuxHeaders 复制请求头到Go对象
-// 入参: key 字段名, value 字段值, data 注册标识
+// 入参: key 字段名, value 字段值, data 用户数据
 func linuxHeaders(key, value *byte, data uintptr) {
-	if target, ok := linuxHeaderTargets.Load(uint64(data)); ok {
-		target.(http.Header).Add(nativeString(key), nativeString(value))
+	if linuxHeaderTarget != nil {
+		linuxHeaderTarget.Add(nativeString(key), nativeString(value))
 	}
+}
+
+// linuxResource 获取原生请求并交给后台Goroutine
+// 入参: request 请求对象, data 用户数据
+func linuxResource(request, data uintptr) {
+	n := active.Load()
+	if n == nil || gtk.RequestView(request) != n.view {
+		return
+	}
+	if n.closed {
+		n.finishEmpty(request, 499, nil)
+		return
+	}
+	uri := gtk.RequestURI(request)
+	req, err := http.NewRequestWithContext(n.ctx, gtk.RequestMethod(request), uri, nil)
+	if err != nil {
+		n.reportError(err)
+		n.finishEmpty(request, 400, nil)
+		return
+	}
+	req.RequestURI = req.URL.RequestURI()
+	headers := gtk.RequestHeaders(request)
+	linuxHeaderTarget = req.Header
+	gtk.HeadersEach(headers, linuxCallbacks.headers, 0)
+	linuxHeaderTarget = nil
+	body := gtk.RequestBody(request)
+	if body != 0 {
+		input := &linuxInput{stream: body, cancel: gtk.CancelNew()}
+		input.stop = context.AfterFunc(req.Context(), input.cancelRead)
+		req.Body = input
+		req.ContentLength = -1
+		if value := req.Header.Get("Content-Length"); value != "" {
+			req.ContentLength, _ = strconv.ParseInt(value, 10, 64)
+		}
+	}
+	gtk.Ref(request)
+	n.resources[request] = true
+	calls := n.calls
+	go func() {
+		if req.Body != nil {
+			defer req.Body.Close()
+		}
+		w := &linuxWriter{window: n, request: request, ctx: req.Context(), header: make(http.Header)}
+		defer func() {
+			if v := recover(); v != nil {
+				w.err = fmt.Errorf("resource handler panic: %v", v)
+				if w.status == 0 {
+					http.Error(w, "Internal Server Error", 500)
+				}
+			}
+			if w.status == 0 {
+				w.WriteHeader(200)
+			}
+			if w.pipe != nil {
+				_ = w.pipe.Close()
+			}
+			if w.stop != nil {
+				w.stop()
+			}
+			if w.err != nil && req.Context().Err() == nil && !isLinuxPeerCanceled(w.err) {
+				n.reportError(w.err)
+			}
+		}()
+		if !localURL(uri) {
+			http.Error(w, "Forbidden", 403)
+			return
+		}
+		if req.URL.Path == "/__guigo/call" {
+			if req.Header.Get("X-Guigo-Token") != n.bridgeToken {
+				http.Error(w, "Forbidden", 403)
+				return
+			}
+			if req.Method != http.MethodPost {
+				http.Error(w, "Method Not Allowed", 405)
+				return
+			}
+			if calls == nil {
+				http.Error(w, "Call closed", 410)
+				return
+			}
+			call := calls.take(req.URL.Query().Get("id"))
+			if call == nil {
+				http.Error(w, "Call closed", 410)
+				return
+			}
+			if input, ok := req.Body.(*linuxInput); ok {
+				stop := context.AfterFunc(call.ctx, input.cancelRead)
+				defer stop()
+			}
+			size, err := strconv.ParseInt(req.Header.Get("X-Guigo-Length"), 10, 64)
+			if err != nil || size < 4 || size > maxBinaryCallSize || req.Body == nil {
+				calls.finish(call)
+				http.Error(w, "Invalid binary size", 400)
+				return
+			}
+			reply := calls.run(call, n.options.Bindings, req.Body, size)
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			_, _ = w.Write(marshalReply(reply))
+			return
+		}
+		if isReservedPath(req.URL.Path) {
+			http.Error(w, "Not Found", 404)
+			return
+		}
+		if n.options.ResourceHandler != nil {
+			resource, err := n.options.ResourceHandler(req)
+			if resource != nil && resource.Body != nil {
+				defer resource.Body.Close()
+			}
+			if err != nil {
+				w.err = err
+				http.Error(w, "Internal Server Error", 500)
+				return
+			}
+			if resource != nil {
+				if resource.Body == nil {
+					status := resource.StatusCode
+					if status == http.StatusNoContent || status == http.StatusNotModified {
+						if resource.Header != nil {
+							w.header = resource.Header.Clone()
+						}
+						w.WriteHeader(status)
+						return
+					}
+					w.err = errors.New("missing resource body")
+					http.Error(w, "Missing resource body", 500)
+					return
+				}
+				size, err := resource.Body.Seek(0, io.SeekEnd)
+				if err == nil {
+					_, err = resource.Body.Seek(0, io.SeekStart)
+				}
+				if err != nil || size < 0 {
+					w.err = err
+					if w.err == nil {
+						w.err = errors.New("invalid resource stream")
+					}
+					http.Error(w, "Invalid resource stream", 500)
+					return
+				}
+				if resource.Header != nil {
+					w.header = resource.Header.Clone()
+				}
+				if w.header.Get("Content-Length") == "" {
+					w.header.Set("Content-Length", strconv.FormatInt(size, 10))
+				}
+				status := resource.StatusCode
+				if status == 0 {
+					status = 200
+				}
+				w.WriteHeader(status)
+				if req.Method != http.MethodHead {
+					_, w.err = io.Copy(w, resource.Body)
+				}
+				return
+			}
+		}
+		if _, ok := n.options.Handler.(fileHandler); ok && strings.HasSuffix(req.URL.Path, "/index.html") {
+			req.URL.Path = strings.TrimSuffix(req.URL.Path, "index.html")
+			req.URL.RawPath = ""
+		}
+		n.options.Handler.ServeHTTP(w, req)
+	}()
 }
 
 // Read 读取原生流并传递取消或读取错误
@@ -81,6 +253,7 @@ func (r *linuxInput) Read(data []byte) (int, error) {
 	defer gtk.Unref(cancel)
 	var nativeErr *linuxError
 	count := gtk.InputRead(stream, unsafe.Pointer(&data[0]), uintptr(len(data)), cancel, &nativeErr)
+	runtime.KeepAlive(data)
 	if count < 0 {
 		return 0, nativeError(nativeErr)
 	}
@@ -117,146 +290,11 @@ func (r *linuxInput) cancelRead() {
 	}
 }
 
-// linuxResource 获取原生请求并交给后台协程
-// 入参: request 请求对象, data 用户数据
-func linuxResource(request, data uintptr) {
-	n := active.Load()
-	if n == nil || gtk.RequestView(request) != n.view {
-		return
-	}
-	uri := gtk.RequestURI(request)
-	req, err := http.NewRequestWithContext(n.pageCtx, gtk.RequestMethod(request), uri, nil)
-	if err != nil {
-		n.fail(err)
-		return
-	}
-	req.RequestURI = req.URL.RequestURI()
-	headers := gtk.RequestHeaders(request)
-	id := linuxHeaderID.Add(1)
-	linuxHeaderTargets.Store(id, req.Header)
-	gtk.HeadersEach(headers, linuxCallbacks.headers, uintptr(id))
-	linuxHeaderTargets.Delete(id)
-	body := gtk.RequestBody(request)
-	if body != 0 {
-		input := &linuxInput{stream: body, cancel: gtk.CancelNew()}
-		input.stop = context.AfterFunc(req.Context(), input.cancelRead)
-		req.Body = input
-		req.ContentLength = -1
-		if value := req.Header.Get("Content-Length"); value != "" {
-			req.ContentLength, _ = strconv.ParseInt(value, 10, 64)
-		}
-	}
-	gtk.Ref(request)
-	n.resources[request] = true
-	calls := n.calls
-	go func() {
-		if req.Body != nil {
-			defer req.Body.Close()
-		}
-		w := &linuxWriter{window: n, request: request, ctx: req.Context(), header: make(http.Header)}
-		defer func() {
-			if v := recover(); v != nil {
-				w.err = fmt.Errorf("resource handler panic: %v", v)
-				if w.status == 0 {
-					http.Error(w, "Internal Server Error", 500)
-				}
-			}
-			if w.status == 0 {
-				w.WriteHeader(200)
-			}
-			if w.pipe != nil {
-				_ = w.pipe.Close()
-			}
-			if w.stop != nil {
-				w.stop()
-			}
-			if w.err != nil && req.Context().Err() == nil {
-				n.fail(w.err)
-			}
-		}()
-		if !localURL(uri) {
-			http.Error(w, "Forbidden", 403)
-			return
-		}
-		if req.URL.Path == "/__guigo/call" {
-			if req.Method != http.MethodPost {
-				http.Error(w, "Method Not Allowed", 405)
-				return
-			}
-			call := calls.take(req.URL.Query().Get("id"))
-			if call == nil {
-				http.Error(w, "Call closed", 410)
-				return
-			}
-			if input, ok := req.Body.(*linuxInput); ok {
-				stop := context.AfterFunc(call.ctx, input.cancelRead)
-				defer stop()
-			}
-			size, err := strconv.ParseInt(req.Header.Get("X-Guigo-Length"), 10, 64)
-			if err != nil || size < 4 || req.Body == nil {
-				calls.finish(call)
-				http.Error(w, "Invalid binary size", 400)
-				return
-			}
-			reply := calls.run(call, n.options.Bindings, req.Body, size)
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("Cache-Control", "no-store")
-			_, _ = w.Write(marshalReply(reply))
-			return
-		}
-		if n.options.ResourceHandler != nil {
-			resource, err := n.options.ResourceHandler(req)
-			if resource != nil && resource.Body != nil {
-				defer resource.Body.Close()
-			}
-			if err != nil {
-				w.err = err
-				http.Error(w, "Internal Server Error", 500)
-				return
-			}
-			if resource != nil {
-				if resource.Body == nil {
-					http.Error(w, "Missing resource body", 500)
-					return
-				}
-				size, err := resource.Body.Seek(0, io.SeekEnd)
-				if err == nil {
-					_, err = resource.Body.Seek(0, io.SeekStart)
-				}
-				if err != nil || size < 0 {
-					w.err = err
-					http.Error(w, "Invalid resource stream", 500)
-					return
-				}
-				w.header = resource.Header.Clone()
-				if w.header == nil {
-					w.header = make(http.Header)
-				}
-				w.header.Set("Content-Length", strconv.FormatInt(size, 10))
-				status := resource.StatusCode
-				if status == 0 {
-					status = 200
-				}
-				w.WriteHeader(status)
-				if req.Method != http.MethodHead {
-					_, w.err = io.Copy(w, resource.Body)
-				}
-				return
-			}
-		}
-		if _, ok := n.options.Handler.(fileHandler); ok && strings.HasSuffix(req.URL.Path, "/index.html") {
-			req.URL.Path = strings.TrimSuffix(req.URL.Path, "index.html")
-			req.URL.RawPath = ""
-		}
-		n.options.Handler.ServeHTTP(w, req)
-	}()
-}
-
 // Header 返回响应头集合
 // 返回: http.Header 响应头
 func (w *linuxWriter) Header() http.Header { return w.header }
 
-// WriteHeader 创建管道并发布原生响应
+// WriteHeader 创建带FD_CLOEXEC标记的管道并发布原生响应
 // 入参: status HTTP状态码
 func (w *linuxWriter) WriteHeader(status int) {
 	if w.status != 0 {
@@ -269,27 +307,28 @@ func (w *linuxWriter) WriteHeader(status int) {
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		w.err = err
-		w.window.fail(err)
 		_ = w.window.enqueue(func() { w.window.finishResponse(w.request, 500, nil) })
 		return
 	}
-	fd, err := syscall.Dup(int(reader.Fd()))
+	fd, err := unix.FcntlInt(reader.Fd(), unix.F_DUPFD_CLOEXEC, 0)
+	runtime.KeepAlive(reader)
 	_ = reader.Close()
 	if err != nil {
 		_ = writer.Close()
 		w.err = err
-		w.window.fail(err)
 		_ = w.window.enqueue(func() { w.window.finishResponse(w.request, 500, nil) })
 		return
 	}
-	stream := gtk.UnixInput(int32(fd), true)
+	stream := gtk.UnixInput(int32(fd), 1)
 	w.pipe = writer
 	stop := context.AfterFunc(w.ctx, func() { _ = writer.Close() })
 	w.stop = stop
 	headers := w.header.Clone()
 	size := int64(-1)
 	if value := headers.Get("Content-Length"); value != "" {
-		size, _ = strconv.ParseInt(value, 10, 64)
+		if parsed, parseErr := strconv.ParseInt(value, 10, 64); parseErr == nil && parsed >= 0 {
+			size = parsed
+		}
 	}
 	discard := func() { gtk.Unref(stream); _ = writer.Close(); stop() }
 	if err = w.window.enqueueCleanup(func() {
@@ -306,7 +345,7 @@ func (w *linuxWriter) WriteHeader(status int) {
 	}
 }
 
-// Write 发送HTTP响应内容
+// Write 发送HTTP响应内容并记录写端错误
 // 入参: data 响应数据
 // 返回: int 写入长度, error 写入错误
 func (w *linuxWriter) Write(data []byte) (int, error) {
@@ -322,17 +361,16 @@ func (w *linuxWriter) Write(data []byte) (int, error) {
 	if w.pipe == nil {
 		return 0, errors.New("response stream unavailable")
 	}
-	return w.pipe.Write(data)
+	n, err := w.pipe.Write(data)
+	if err != nil {
+		w.err = err
+	}
+	return n, err
 }
 
-// respondStream 将原生流交给WebKit并释放请求引用
+// sendResponse 向WebKit提交原生流响应
 // 入参: request 请求对象, stream 原生流, size 响应长度, status 状态码, headers 响应头
-func (n *nativeWindow) respondStream(request, stream uintptr, size int64, status int, headers http.Header) {
-	if !n.resources[request] {
-		return
-	}
-	delete(n.resources, request)
-	defer gtk.Unref(request)
+func (n *nativeWindow) sendResponse(request, stream uintptr, size int64, status int, headers http.Header) {
 	response := gtk.ResponseNew(stream, size)
 	defer gtk.Unref(response)
 	gtk.ResponseStatus(response, uint32(status), http.StatusText(status))
@@ -353,22 +391,32 @@ func (n *nativeWindow) respondStream(request, stream uintptr, size int64, status
 	gtk.FinishResponse(request, response)
 }
 
-// finishResponse 关闭尚未完成的请求
+// finishEmpty 使用空内存流直接结束尚未登记的原生请求
+// 入参: request 请求对象, status 状态码, headers 响应头
+func (n *nativeWindow) finishEmpty(request uintptr, status int, headers http.Header) {
+	stream := gtk.MemoryInput()
+	defer gtk.Unref(stream)
+	n.sendResponse(request, stream, 0, status, headers)
+}
+
+// respondStream 将原生流交给WebKit并释放请求引用
+// 入参: request 请求对象, stream 原生流, size 响应长度, status 状态码, headers 响应头
+func (n *nativeWindow) respondStream(request, stream uintptr, size int64, status int, headers http.Header) {
+	if !n.resources[request] {
+		return
+	}
+	delete(n.resources, request)
+	defer gtk.Unref(request)
+	n.sendResponse(request, stream, size, status, headers)
+}
+
+// finishResponse 使用空内存流关闭尚未完成的请求
 // 入参: request 请求对象, status 状态码, headers 响应头
 func (n *nativeWindow) finishResponse(request uintptr, status int, headers http.Header) {
 	if !n.resources[request] {
 		return
 	}
-	file := gtk.FileNew("/dev/null")
-	defer gtk.Unref(file)
-	var nativeErr *linuxError
-	stream := gtk.FileRead(file, 0, &nativeErr)
-	if stream == 0 {
-		n.fail(nativeError(nativeErr))
-		delete(n.resources, request)
-		gtk.Unref(request)
-		return
-	}
+	stream := gtk.MemoryInput()
 	defer gtk.Unref(stream)
 	n.respondStream(request, stream, 0, status, headers)
 }

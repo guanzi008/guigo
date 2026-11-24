@@ -12,13 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !(windows && amd64) && !(linux && !android && (amd64 || arm64) && !guigo_gtk3)
+//go:build (windows && amd64) || (linux && !android && (amd64 || arm64) && !guigo_gtk3)
 
 package guigo
 
-// newTray 返回未适配平台错误，托盘与窗口宿主的支持范围分别维护
-// 入参: options 托盘配置
-// 返回: *Tray 空句柄, error 平台错误
-func (n *nativeWindow) newTray(options TrayOptions) (*Tray, error) {
-	return nil, ErrUnsupportedPlatform
+// localURL 判断请求是否属于宿主来源
+// 入参: raw 资源地址
+// 返回: bool 是否属于宿主来源
+func localURL(raw string) bool {
+	return localResource(resourceOrigin, raw)
+}
+
+// resourceURL 构造宿主资源地址
+// 入参: path 资源路径
+// 返回: string 宿主资源地址
+func resourceURL(path string) string {
+	return resourceAddress(resourceOrigin, path)
 }

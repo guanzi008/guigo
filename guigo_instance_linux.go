@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !android && (amd64 || arm64 || loong64)
+
 package guigo
 
 import (
@@ -20,60 +22,110 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"golang.org/x/sys/unix"
 )
 
-// unixInstance 持有不落盘的Linux实例入口
+// unixInstance 持有Linux本机套接字实例入口与排他锁文件
 type unixInstance struct {
 	*net.UnixListener
-	once sync.Once
-	err  error
+	lockFile *os.File
+	sockPath string
+	stopOnce sync.Once
+	stopErr  error
+	once     sync.Once
+	err      error
 }
 
-// instanceAddress 生成当前用户及图形会话的抽象套接字地址
+// linuxRuntimeDir 校验XDG_RUNTIME_DIR存在、非符号链接、权限为0700且属主为当前有效用户
+// 返回: string 校验通过的运行时目录路径，不合法时返回空字符串
+func linuxRuntimeDir() string {
+	dir := os.Getenv("XDG_RUNTIME_DIR")
+	if dir == "" || !filepath.IsAbs(dir) || strings.ContainsRune(dir, 0) {
+		return ""
+	}
+	dir = filepath.Clean(dir)
+	var st unix.Stat_t
+	if err := unix.Lstat(dir, &st); err != nil {
+		return ""
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFDIR || st.Mode&0o777 != 0o700 || st.Uid != uint32(os.Geteuid()) {
+		return ""
+	}
+	return dir
+}
+
+// instanceAddress 生成当前用户及图形会话的本机套接字地址，优先使用私有XDG_RUNTIME_DIR路径
 // 入参: key 调用方实例键
-// 返回: string 地址, error 标识错误
+// 返回: string 入口地址, error 标识错误
 func instanceAddress(key string) (string, error) {
-	session := os.Getenv("XDG_RUNTIME_DIR") + ":" + os.Getenv("WAYLAND_DISPLAY") + ":" + os.Getenv("DISPLAY")
-	return "@guigo." + instanceHash(fmt.Sprintf("%d:%s", os.Geteuid(), session), key), nil
+	rawRuntimeDir := os.Getenv("XDG_RUNTIME_DIR")
+	wayland := os.Getenv("WAYLAND_DISPLAY")
+	var session string
+	if wayland != "" {
+		session = "wayland\x00" + rawRuntimeDir + "\x00" + wayland
+	} else {
+		session = "x11\x00" + rawRuntimeDir + "\x00" + os.Getenv("DISPLAY")
+	}
+	hash := instanceHash(fmt.Sprintf("%d\x00%s", os.Geteuid(), session), key)
+	if dir := linuxRuntimeDir(); dir != "" {
+		for _, tag := range []string{hash, hash[:32]} {
+			sockPath := filepath.Join(dir, "guigo-"+tag+".sock")
+			if len(sockPath) <= 107 {
+				return sockPath, nil
+			}
+		}
+	}
+	return "@guigo." + hash, nil
 }
 
-// listenInstance 原子取得抽象套接字入口，已有实例时返回nil
+// listenInstance 原子取得单实例监听入口，已有活跃实例时返回nil
 // 入参: address 入口地址
 // 返回: instanceListener 接收端或nil, error 创建错误
 func listenInstance(address string) (instanceListener, error) {
-	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: address, Net: "unix"})
-	if errors.Is(err, unix.EADDRINUSE) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &unixInstance{UnixListener: listener}, nil
-}
-
-// Close 释放抽象套接字入口，可重复调用
-// 返回: error 关闭错误
-func (l *unixInstance) Close() error {
-	l.once.Do(func() { l.err = l.UnixListener.Close() })
-	return l.err
-}
-
-// Accept 接收并校验同一用户的本机连接
-// 返回: instanceConn 连接, error 接收错误
-func (l *unixInstance) Accept() (instanceConn, error) {
-	for {
-		conn, err := l.AcceptUnix()
+	if strings.HasPrefix(address, "@") {
+		listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: address, Net: "unix"})
+		if errors.Is(err, unix.EADDRINUSE) {
+			return nil, nil
+		}
 		if err != nil {
 			return nil, err
 		}
-		if err := checkInstancePeer(conn); err == nil {
-			return conn, nil
-		}
-		conn.Close()
+		return &unixInstance{UnixListener: listener}, nil
 	}
+	lockPath := strings.TrimSuffix(address, ".sock") + ".lock"
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		err = unix.Flock(int(lockFile.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if !errors.Is(err, unix.EINTR) {
+			break
+		}
+	}
+	if err != nil {
+		_ = lockFile.Close()
+		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if err := os.Remove(address); err != nil && !os.IsNotExist(err) {
+		_ = lockFile.Close()
+		return nil, err
+	}
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: address, Net: "unix"})
+	if err != nil {
+		_ = lockFile.Close()
+		return nil, err
+	}
+	listener.SetUnlinkOnClose(false)
+	_ = os.Chmod(address, 0600)
+	return &unixInstance{UnixListener: listener, lockFile: lockFile, sockPath: address}, nil
 }
 
 // dialInstance 连接并验证已有实例的用户身份
@@ -91,7 +143,7 @@ func dialInstance(ctx context.Context, address string) (instanceConn, error) {
 	return conn.(*net.UnixConn), nil
 }
 
-// checkInstancePeer 校验抽象套接字对端的有效用户
+// checkInstancePeer 校验本机套接字对端的有效用户
 // 入参: conn 本机连接
 // 返回: error 身份错误
 func checkInstancePeer(conn *net.UnixConn) error {
@@ -114,5 +166,46 @@ func checkInstancePeer(conn *net.UnixConn) error {
 // 入参: err 连接错误
 // 返回: bool 是否可重试
 func instanceUnavailable(err error) bool {
-	return errors.Is(err, unix.ECONNREFUSED) || errors.Is(err, unix.ENOENT)
+	return errors.Is(err, unix.ECONNREFUSED) || errors.Is(err, unix.ENOENT) || errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK)
+}
+
+// stop 停止接收新连接，暂不清理套接字文件与排他锁
+// 返回: error 停止错误
+func (l *unixInstance) stop() error {
+	l.stopOnce.Do(func() {
+		l.stopErr = l.UnixListener.Close()
+	})
+	return l.stopErr
+}
+
+// Close 停止监听、在持锁状态下清理套接字文件并释放锁，可重复调用
+// 返回: error 关闭错误
+func (l *unixInstance) Close() error {
+	l.once.Do(func() {
+		l.err = l.stop()
+		if l.sockPath != "" {
+			_ = os.Remove(l.sockPath)
+		}
+		if l.lockFile != nil {
+			if closeErr := l.lockFile.Close(); l.err == nil {
+				l.err = closeErr
+			}
+		}
+	})
+	return l.err
+}
+
+// Accept 接收并校验同一用户的本机连接
+// 返回: instanceConn 连接, error 接收错误
+func (l *unixInstance) Accept() (instanceConn, error) {
+	for {
+		conn, err := l.AcceptUnix()
+		if err != nil {
+			return nil, err
+		}
+		if err := checkInstancePeer(conn); err == nil {
+			return conn, nil
+		}
+		conn.Close()
+	}
 }

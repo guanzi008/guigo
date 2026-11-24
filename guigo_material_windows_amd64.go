@@ -19,13 +19,26 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 )
 
-// SupportsWindowMaterial 查询当前平台是否提供指定窗口材质，实际效果由系统外观设置决定
+// supportsWindowMaterial 查询当前平台是否提供指定窗口材质，实际效果由系统外观设置决定
 // 入参: material 窗口材质
 // 返回: bool 是否支持
-func SupportsWindowMaterial(material WindowMaterial) bool {
+func supportsWindowMaterial(material WindowMaterial) bool {
 	return material == WindowSolid || (material == WindowMicaAlt || material == WindowAcrylic) && windows.RtlGetVersion().BuildNumber >= 22621
+}
+
+// systemDark 读取Windows个性化设置判断是否偏好深色应用外观
+// 返回: bool 是否偏好深色外观
+func systemDark() bool {
+	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Themes\Personalize`, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	defer key.Close()
+	value, _, err := key.GetIntegerValue("AppsUseLightTheme")
+	return err == nil && value == 0
 }
 
 // setWindowMaterial 在宿主线程切换材质，失败时恢复当前窗口外观
@@ -76,7 +89,7 @@ func (n *nativeWindow) applyWindowMaterial() error {
 	return n.applyTitleBarColors(n.currentTitleBarInfo().Active)
 }
 
-// initializeWindowMaterial 设置WebView透明底色，使页面透明区域透出宿主的系统材质
+// initializeWindowMaterial 在非纯色模式下初始化窗口材质与WebView透明底色
 // 返回: error WebView接口或背景设置错误
 func (n *nativeWindow) initializeWindowMaterial() error {
 	if n.options.WindowMaterial == WindowSolid {

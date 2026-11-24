@@ -14,7 +14,10 @@
 
 package guigo
 
-import "unsafe"
+import (
+	"fmt"
+	"unsafe"
+)
 
 // fileDrop 读取WebView2提供的原生文件路径
 // 入参: args 拖放消息参数
@@ -24,7 +27,7 @@ func (n *nativeWindow) fileDrop(args *comObject) {
 	}
 	iid := guid("{06FC7AB7-C90C-4297-9389-33CA01CF6D5E}")
 	var extended *comObject
-	if hresult(com(args, 0, uintptr(unsafe.Pointer(&iid)), uintptr(unsafe.Pointer(&extended)))) != nil {
+	if hresult(com(args, 0, uintptr(unsafe.Pointer(&iid)), uintptr(unsafe.Pointer(&extended)))) != nil || extended == nil {
 		return
 	}
 	defer release(extended)
@@ -41,10 +44,10 @@ func (n *nativeWindow) fileDrop(args *comObject) {
 	iid = guid("{F2C19559-6BC1-4583-A757-90021BE9AFEC}")
 	for i := uint32(0); i < count; i++ {
 		var object, file *comObject
-		if hresult(com(objects, 4, uintptr(i), uintptr(unsafe.Pointer(&object)))) != nil {
+		if hresult(com(objects, 4, uintptr(i), uintptr(unsafe.Pointer(&object)))) != nil || object == nil {
 			continue
 		}
-		if hresult(com(object, 0, uintptr(unsafe.Pointer(&iid)), uintptr(unsafe.Pointer(&file)))) == nil {
+		if hresult(com(object, 0, uintptr(unsafe.Pointer(&iid)), uintptr(unsafe.Pointer(&file)))) == nil && file != nil {
 			path, err := comString(file, 3)
 			if err == nil && path != "" {
 				paths = append(paths, path)
@@ -54,6 +57,13 @@ func (n *nativeWindow) fileDrop(args *comObject) {
 		release(object)
 	}
 	if len(paths) > 0 {
-		go n.options.OnDrop(paths)
+		go func() {
+			defer func() {
+				if v := recover(); v != nil {
+					n.reportError(fmt.Errorf("OnDrop panic: %v", v))
+				}
+			}()
+			n.options.OnDrop(paths)
+		}()
 	}
 }

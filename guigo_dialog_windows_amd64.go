@@ -15,12 +15,15 @@
 package guigo
 
 import (
-	"errors"
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 // guid 解析系统接口标识
@@ -32,24 +35,85 @@ func guid(text string) syscall.GUID {
 	return value
 }
 
+// dialogDefaultLocation 归一化对话框默认目录与文件名，忽略不存在的目录
+// 入参: defaultPath 默认路径, defaultName 默认文件名
+// 返回: string 存在的绝对目录, string 默认文件名
+func dialogDefaultLocation(defaultPath, defaultName string) (string, string) {
+	if defaultPath == "" {
+		return "", defaultName
+	}
+	abs, err := filepath.Abs(defaultPath)
+	if err != nil {
+		return "", defaultName
+	}
+	if info, err := os.Stat(abs); err == nil && info.IsDir() {
+		return abs, defaultName
+	}
+	name := defaultName
+	if name == "" {
+		if base := filepath.Base(abs); base != "" && base != "." && base != string(filepath.Separator) {
+			name = base
+		}
+	}
+	parent := filepath.Dir(abs)
+	if info, err := os.Stat(parent); err == nil && info.IsDir() {
+		return parent, name
+	}
+	return "", name
+}
+
+// shellPath 获取原生文件系统路径
+// 入参: item 文件系统对象
+// 返回: string 文件路径, error 读取错误
+func shellPath(item *comObject) (string, error) {
+	var value *uint16
+	if err := hresult(com(item, 5, 0x80058000, uintptr(unsafe.Pointer(&value)))); err != nil {
+		return "", err
+	}
+	defer ole32.NewProc("CoTaskMemFree").Call(uintptr(unsafe.Pointer(value)))
+	return windows.UTF16PtrToString(value), nil
+}
+
+// closeFileDialog 关闭活动文件对话框，兼顾原生接口与对话框窗口关闭消息
+// 入参: dialog 原生文件对话框接口
+func closeFileDialog(dialog *comObject) {
+	if dialog == nil {
+		return
+	}
+	com(dialog, 23, 0x800704c7)
+	iid := guid("{00000114-0000-0000-C000-000000000046}")
+	var oleWindow *comObject
+	if hresult(com(dialog, 0, uintptr(unsafe.Pointer(&iid)), uintptr(unsafe.Pointer(&oleWindow)))) == nil && oleWindow != nil {
+		var hwnd uintptr
+		if hresult(com(oleWindow, 3, uintptr(unsafe.Pointer(&hwnd)))) == nil && hwnd != 0 {
+			user32.NewProc("PostMessageW").Call(hwnd, 0x10, 0, 0)
+		}
+		release(oleWindow)
+	}
+}
+
 // dialog 运行单结果原生对话框
-// 入参: o 对话框选项, mode 对话框类型
+// 入参: ctx 调用上下文, o 对话框选项, mode 对话框类型
 // 返回: string 文件路径, error 对话框错误
-func (n *nativeWindow) dialog(o DialogOptions, mode int) (string, error) {
-	paths, err := n.dialogs(o, mode)
+func (n *nativeWindow) dialog(ctx context.Context, o DialogOptions, mode int) (string, error) {
+	paths, err := n.dialogs(ctx, o, mode)
 	if err != nil {
 		return "", err
 	}
 	return paths[0], nil
 }
 
-// dialogs 在宿主线程显示IFileDialog
-// 入参: o 对话框选项, mode 对话框类型
+// dialogs 在宿主线程显示IFileDialog并响应上下文取消
+// 入参: ctx 调用上下文, o 对话框选项, mode 对话框类型
 // 返回: []string 文件路径, error 对话框错误
-func (n *nativeWindow) dialogs(o DialogOptions, mode int) (paths []string, err error) {
-	err = n.invokeTop(func() error {
-		if n.activeDialog != nil {
-			return errors.New("another file dialog is active")
+func (n *nativeWindow) dialogs(ctx context.Context, o DialogOptions, mode int) (paths []string, err error) {
+	if !n.dialogActive.CompareAndSwap(false, true) {
+		return nil, ErrDialogBusy
+	}
+	defer n.dialogActive.Store(false)
+	err = n.invokeTop(ctx, func() error {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		clsid := guid("{DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7}")
 		iid := guid("{D57C7288-D4AD-4768-BE02-9D969532D960}")
@@ -86,11 +150,27 @@ func (n *nativeWindow) dialogs(o DialogOptions, mode int) (paths []string, err e
 			Name    *uint16
 			Pattern *uint16
 		}
-		filters := make([]filter, len(o.Filters))
-		for i, f := range o.Filters {
-			filters[i] = filter{wide(f.Name), wide(f.Pattern)}
+		var filters []filter
+		if mode != 2 {
+			for _, f := range o.Filters {
+				var patterns []string
+				for _, part := range strings.Split(f.Pattern, ";") {
+					if part = strings.TrimSpace(part); part != "" {
+						patterns = append(patterns, part)
+					}
+				}
+				if len(patterns) == 0 {
+					continue
+				}
+				pattern := strings.Join(patterns, ";")
+				name := f.Name
+				if name == "" {
+					name = pattern
+				}
+				filters = append(filters, filter{wide(name), wide(pattern)})
+			}
 		}
-		if len(filters) > 0 && mode != 2 {
+		if len(filters) > 0 {
 			if err := hresult(com(dialog, 4, uintptr(len(filters)), uintptr(unsafe.Pointer(&filters[0])))); err != nil {
 				return err
 			}
@@ -110,17 +190,41 @@ func (n *nativeWindow) dialogs(o DialogOptions, mode int) (paths []string, err e
 				release(item)
 			}
 		}
-		if err := n.ctx.Err(); err != nil {
+		if n.ctx.Err() != nil || n.quitting || n.closed {
+			return ErrClosed
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		n.activeDialog = dialog
-		defer func() { n.activeDialog = nil }()
+		n.modalActive++
+		stop := context.AfterFunc(ctx, func() {
+			_ = n.enqueue(func() {
+				if n.activeDialog == dialog {
+					closeFileDialog(dialog)
+				}
+			})
+		})
+		defer func() {
+			stop()
+			n.activeDialog = nil
+			n.leaveModal()
+		}()
 		hr = com(dialog, 3, n.hwnd)
 		runtime.KeepAlive(filters)
 		if uint32(hr) == 0x800704c7 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if n.ctx.Err() != nil || n.quitting || n.closed {
+				return ErrClosed
+			}
 			return ErrCanceled
 		}
 		if err := hresult(hr); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if mode == 3 {
@@ -160,43 +264,4 @@ func (n *nativeWindow) dialogs(o DialogOptions, mode int) (paths []string, err e
 		return nil
 	})
 	return
-}
-
-// dialogDefaultLocation 归一化对话框默认目录与文件名，忽略不存在的目录
-// 入参: defaultPath 默认路径, defaultName 默认文件名
-// 返回: string 存在的绝对目录, string 默认文件名
-func dialogDefaultLocation(defaultPath, defaultName string) (string, string) {
-	if defaultPath == "" {
-		return "", defaultName
-	}
-	abs, err := filepath.Abs(defaultPath)
-	if err != nil {
-		return "", defaultName
-	}
-	if info, err := os.Stat(abs); err == nil && info.IsDir() {
-		return abs, defaultName
-	}
-	name := defaultName
-	if name == "" {
-		if base := filepath.Base(abs); base != "" && base != "." && base != string(filepath.Separator) {
-			name = base
-		}
-	}
-	parent := filepath.Dir(abs)
-	if info, err := os.Stat(parent); err == nil && info.IsDir() {
-		return parent, name
-	}
-	return "", name
-}
-
-// shellPath 获取原生文件系统路径
-// 入参: item 文件系统对象
-// 返回: string 文件路径, error 读取错误
-func shellPath(item *comObject) (string, error) {
-	var value *uint16
-	if err := hresult(com(item, 5, 0x80058000, uintptr(unsafe.Pointer(&value)))); err != nil {
-		return "", err
-	}
-	defer ole32.NewProc("CoTaskMemFree").Call(uintptr(unsafe.Pointer(value)))
-	return utf16String(value), nil
 }

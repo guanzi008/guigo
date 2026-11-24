@@ -30,17 +30,13 @@ import (
 	"golang.org/x/sys/windows/registry"
 )
 
-// associationMu 串行化同一进程内的关联读写
-var associationMu sync.Mutex
-
-// associationSetValue 写入任意注册表值类型，供登记和失败回滚使用
-var associationSetValue = windows.NewLazySystemDLL("advapi32.dll").NewProc("RegSetValueExW")
-
-// associationDeleteKey 删除64位注册表视图中的指定键
-var associationDeleteKey = windows.NewLazySystemDLL("advapi32.dll").NewProc("RegDeleteKeyExW")
-
-// associationNotify 通知系统刷新文件关联
-var associationNotify = windows.NewLazySystemDLL("shell32.dll").NewProc("SHChangeNotify")
+// 文件关联操作锁与系统注册表和外壳刷新接口
+var (
+	associationMu        sync.Mutex
+	associationSetValue  = windows.NewLazySystemDLL("advapi32.dll").NewProc("RegSetValueExW")
+	associationDeleteKey = windows.NewLazySystemDLL("advapi32.dll").NewProc("RegDeleteKeyExW")
+	associationNotify    = windows.NewLazySystemDLL("shell32.dll").NewProc("SHChangeNotify")
+)
 
 // associationValue 保存一个注册表值及其位置
 type associationValue struct {
@@ -128,17 +124,34 @@ func readAssociationValue(root registry.Key, path, name string) (associationValu
 		return value, err
 	}
 	defer key.Close()
-	size, kind, err := key.GetValue(name, nil)
+	size, _, err := key.GetValue(name, nil)
 	if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
 		return value, nil
 	}
 	if err != nil {
 		return value, err
 	}
-	value.kind, value.data = kind, make([]byte, size)
-	_, value.kind, err = key.GetValue(name, value.data)
-	value.exists = err == nil
-	return value, err
+	for range 5 {
+		buf := make([]byte, size)
+		n, kind, err := key.GetValue(name, buf)
+		if errors.Is(err, registry.ErrShortBuffer) || errors.Is(err, windows.ERROR_MORE_DATA) {
+			size = n
+			continue
+		}
+		if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+			return value, nil
+		}
+		if err != nil {
+			return value, err
+		}
+		if n > len(buf) {
+			size = n
+			continue
+		}
+		value.kind, value.data, value.exists = kind, buf[:n], true
+		return value, nil
+	}
+	return value, windows.ERROR_MORE_DATA
 }
 
 // writeAssociationValue 写入或删除指定键中的单个值
@@ -269,6 +282,39 @@ func deleteAssociationKey(root registry.Key, path string) error {
 	return nil
 }
 
+// readStoredAssociations 读取当前应用在Capabilities下已登记的扩展名与ProgID映射
+// 入参: root 注册表根, o 应用配置
+// 返回: map[string]string 已登记的扩展名到ProgID映射, error 查询错误
+func readStoredAssociations(root registry.Key, o AssociationOptions) (map[string]string, error) {
+	stored := make(map[string]string)
+	key, err := registry.OpenKey(root, associationPath(o)+`\Capabilities\FileAssociations`, registry.READ|registry.WOW64_64KEY)
+	if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+		return stored, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer key.Close()
+	names, err := key.ReadValueNames(-1)
+	if err != nil {
+		return nil, err
+	}
+	prefix := o.AppID + "."
+	for _, ext := range names {
+		if !strings.HasPrefix(ext, ".") || strings.ContainsAny(ext, "\\\x00") {
+			continue
+		}
+		progID, _, err := key.GetStringValue(ext)
+		if err != nil {
+			continue
+		}
+		if len(progID) > len(prefix) && strings.EqualFold(progID[:len(prefix)], prefix) && !strings.ContainsAny(progID, "\\\x00") {
+			stored[ext] = progID
+		}
+	}
+	return stored, nil
+}
+
 // queryFileAssociations 查询独立范围并报告当前进程是否允许写入
 // 入参: o 应用配置, scope 作用范围
 // 返回: AssociationStatus 登记状态, error 查询错误
@@ -294,6 +340,23 @@ func queryAssociation(root registry.Key, o AssociationOptions) (AssociationStatu
 		status.Registered = status.Registered || got.exists
 		complete = complete && got.exists && got.kind == expected.kind && bytes.Equal(got.data, expected.data)
 	}
+	expectedExt := make(map[string]string)
+	for _, kind := range o.Types {
+		id := o.AppID + "." + kind.ID
+		for _, ext := range kind.Extensions {
+			expectedExt[strings.ToLower(ext)] = id
+		}
+	}
+	stored, err := readStoredAssociations(root, o)
+	if err != nil {
+		return status, err
+	}
+	for ext, progID := range stored {
+		status.Registered = true
+		if expected, ok := expectedExt[strings.ToLower(ext)]; !ok || !strings.EqualFold(expected, progID) {
+			complete = false
+		}
+	}
 	paths := []string{associationPath(o)}
 	for _, kind := range o.Types {
 		paths = append(paths, `Software\Classes\`+o.AppID+"."+kind.ID)
@@ -311,7 +374,7 @@ func queryAssociation(root registry.Key, o AssociationOptions) (AssociationStatu
 	return status, nil
 }
 
-// registerFileAssociations 登记当前范围并通知系统刷新
+// registerFileAssociations 登记当前范围，仅成功后通知系统刷新
 // 入参: o 应用配置, scope 作用范围
 // 返回: error 登记错误
 func registerFileAssociations(o AssociationOptions, scope AssociationScope) error {
@@ -327,14 +390,21 @@ func registerFileAssociations(o AssociationOptions, scope AssociationScope) erro
 	if file.IsDir() {
 		return errors.New("association executable is a directory")
 	}
-	defer associationNotify.Call(0x08000000, 0, 0, 0)
-	return registerAssociation(associationRoot(scope), o)
+	if err := registerAssociation(associationRoot(scope), o); err != nil {
+		return err
+	}
+	associationNotify.Call(0x08000000, 0, 0, 0)
+	return nil
 }
 
-// registerAssociation 写入关联并在失败时恢复本次修改
+// registerAssociation 写入关联并在失败时恢复本次修改，成功后清理旧登记残留
 // 入参: root 注册表根, o 应用配置
 // 返回: error 登记或回滚错误
 func registerAssociation(root registry.Key, o AssociationOptions) (result error) {
+	oldStored, err := readStoredAssociations(root, o)
+	if err != nil {
+		return err
+	}
 	values := associationValues(o)
 	var created []string
 	var undo []associationValue
@@ -369,10 +439,39 @@ func registerAssociation(root registry.Key, o AssociationOptions) (result error)
 		}
 		undo = append(undo, old)
 	}
+	newExt := make(map[string]string)
+	newProgIDs := make(map[string]bool)
+	for _, kind := range o.Types {
+		id := o.AppID + "." + kind.ID
+		newProgIDs[strings.ToLower(id)] = true
+		for _, ext := range kind.Extensions {
+			newExt[strings.ToLower(ext)] = id
+		}
+	}
+	capabilityExt := associationPath(o) + `\Capabilities\FileAssociations`
+	staleProgIDs := make(map[string]string)
+	for ext, oldProgID := range oldStored {
+		lowerExt := strings.ToLower(ext)
+		if newProgID, ok := newExt[lowerExt]; !ok {
+			_ = writeAssociationValue(root, associationValue{path: capabilityExt, name: ext})
+			openWith := `Software\Classes\` + ext + `\OpenWithProgids`
+			_ = writeAssociationValue(root, associationValue{path: openWith, name: oldProgID})
+			_ = removeAssociationEmptyKey(root, openWith)
+		} else if !strings.EqualFold(newProgID, oldProgID) {
+			openWith := `Software\Classes\` + ext + `\OpenWithProgids`
+			_ = writeAssociationValue(root, associationValue{path: openWith, name: oldProgID})
+		}
+		if lowerOld := strings.ToLower(oldProgID); !newProgIDs[lowerOld] {
+			staleProgIDs[lowerOld] = oldProgID
+		}
+	}
+	for _, oldProgID := range staleProgIDs {
+		_ = removeAssociationTree(root, `Software\Classes\`+oldProgID)
+	}
 	return nil
 }
 
-// unregisterFileAssociations 撤销当前范围并通知系统刷新
+// unregisterFileAssociations 撤销当前范围，仅成功后通知系统刷新
 // 入参: o 应用配置, scope 作用范围
 // 返回: error 撤销错误
 func unregisterFileAssociations(o AssociationOptions, scope AssociationScope) error {
@@ -381,21 +480,40 @@ func unregisterFileAssociations(o AssociationOptions, scope AssociationScope) er
 	if scope == AssociationMachine && !windows.GetCurrentProcessToken().IsElevated() {
 		return ErrAssociationElevationRequired
 	}
-	defer associationNotify.Call(0x08000000, 0, 0, 0)
-	return unregisterAssociation(associationRoot(scope), o)
+	if err := unregisterAssociation(associationRoot(scope), o); err != nil {
+		return err
+	}
+	associationNotify.Call(0x08000000, 0, 0, 0)
+	return nil
 }
 
-// unregisterAssociation 整树删除专用键，公共键只删除本应用的值
+// unregisterAssociation 整树删除专用键及旧历史ProgID，公共键仅删除本应用的值并清理空的OpenWithProgids
 // 入参: root 注册表根, o 应用配置
 // 返回: error 撤销错误
 func unregisterAssociation(root registry.Key, o AssociationOptions) error {
 	var result error
+	oldStored, err := readStoredAssociations(root, o)
+	if err != nil {
+		result = errors.Join(result, err)
+	}
 	result = errors.Join(result, writeAssociationValue(root, associationValue{path: `Software\RegisteredApplications`, name: o.AppID}))
+	progIDs := make(map[string]string)
+	for ext, oldProgID := range oldStored {
+		openWith := `Software\Classes\` + ext + `\OpenWithProgids`
+		result = errors.Join(result, writeAssociationValue(root, associationValue{path: openWith, name: oldProgID}))
+		result = errors.Join(result, removeAssociationEmptyKey(root, openWith))
+		progIDs[strings.ToLower(oldProgID)] = oldProgID
+	}
 	for _, kind := range o.Types {
 		id := o.AppID + "." + kind.ID
+		progIDs[strings.ToLower(id)] = id
 		for _, extension := range kind.Extensions {
-			result = errors.Join(result, writeAssociationValue(root, associationValue{path: `Software\Classes\` + extension + `\OpenWithProgids`, name: id}))
+			openWith := `Software\Classes\` + extension + `\OpenWithProgids`
+			result = errors.Join(result, writeAssociationValue(root, associationValue{path: openWith, name: id}))
+			result = errors.Join(result, removeAssociationEmptyKey(root, openWith))
 		}
+	}
+	for _, id := range progIDs {
 		result = errors.Join(result, removeAssociationTree(root, `Software\Classes\`+id))
 	}
 	return errors.Join(result, removeAssociationTree(root, associationPath(o)))

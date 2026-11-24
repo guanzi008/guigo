@@ -16,6 +16,8 @@ package guigo
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,12 +28,19 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
-// resourceOrigin 为WebView2拦截的内部资源来源
-const resourceOrigin = "https://guigo.localhost"
+// Windows宿主保留资源来源与待发事件上限
+const (
+	resourceOrigin   = "https://guigo.localhost"
+	maxPendingEvents = 1024
+)
 
+// Win32与COM延迟加载库、当前宿主状态及原生回调入口
 var (
 	user32        = syscall.NewLazyDLL("user32.dll")
 	ole32         = syscall.NewLazyDLL("ole32.dll")
@@ -44,6 +53,12 @@ var (
 		syscall.NewCallback(callbackAdd),
 		syscall.NewCallback(callbackRelease),
 		syscall.NewCallback(callbackInvoke),
+	}
+	scalarCallbackTable = [4]uintptr{
+		syscall.NewCallback(callbackQuery),
+		syscall.NewCallback(callbackAdd),
+		syscall.NewCallback(callbackRelease),
+		syscall.NewCallback(scalarCallbackInvoke),
 	}
 	callbackRoots sync.Map
 )
@@ -97,12 +112,14 @@ type windowClass struct {
 	SmallIcon   uintptr
 }
 
-// comCallback 保存COM回调与引用计数
+// comCallback 保存COM回调、固定句柄与引用计数
 type comCallback struct {
-	Table *[4]uintptr
-	Refs  atomic.Int32
-	IID   syscall.GUID
-	Fn    func(uintptr, *comObject) uintptr
+	Table    *[4]uintptr
+	Refs     atomic.Int32
+	IID      syscall.GUID
+	Fn       func(uintptr, *comObject) uintptr
+	ScalarFn func(uintptr, uintptr) uintptr
+	pin      runtime.Pinner
 }
 
 // comObject 保存COM接口的虚函数表指针
@@ -110,53 +127,73 @@ type comObject struct {
 	table *uintptr
 }
 
+// eventToken 保存WebView2事件注销索引和登记令牌
+type eventToken struct {
+	removeIndex int
+	token       int64
+}
+
 // nativeWindow 保存STA线程拥有的原生对象
 type nativeWindow struct {
-	options         Options
-	mu              sync.Mutex
-	ctx             context.Context
-	cancel          context.CancelFunc
-	done            chan struct{}
-	queue           []queuedCall
-	topQueue        []func()
-	hwnd            uintptr
-	contentWindow   uintptr
-	dragWindow      uintptr
-	dragRegions     []Rect
-	titleBarState   TitleBarInfo
-	titleBarDPI     uint32
-	titleBarEvents  chan TitleBarInfo
-	titleBarReady   bool
-	titleBarPending bool
-	titleBarLayout  bool
-	dpi             uint32
-	iconData        []byte
-	icons           [2]uintptr
-	trays           map[uint32]*windowsTray
-	nextTrayID      uint32
-	activeTrayMenu  *windowsTray
-	environment     *comObject
-	controller      *comObject
-	webview         *comObject
-	activeDialog    *comObject
-	printActive     bool
-	callbacks       []*comCallback
-	generation      uint64
-	pageCtx         context.Context
-	pageCancel      context.CancelFunc
-	calls           *callQueue
-	pendingEvents   []string
-	resources       map[*comObject]resourceRequest
-	temporary       temporaryDirectory
-	initializing    bool
-	ready           bool
-	shown           bool
-	hidden          bool
-	closing         bool
-	closePending    bool
-	closeRequested  bool
-	closed          bool
-	err             error
+	options          Options
+	title            string
+	bridgeToken      string
+	threadID         uint32
+	mu               sync.Mutex
+	ctx              context.Context
+	cancel           context.CancelFunc
+	done             chan struct{}
+	queue            []queuedCall
+	topQueue         []func()
+	hwnd             uintptr
+	contentWindow    uintptr
+	dragWindow       uintptr
+	dragRegions      []Rect
+	titleBarState    TitleBarInfo
+	titleBarDPI      uint32
+	titleBarEvents   chan TitleBarInfo
+	titleBarWG       sync.WaitGroup
+	readyWG          sync.WaitGroup
+	titleBarReady    bool
+	titleBarPending  bool
+	titleBarLayout   bool
+	dpi              uint32
+	iconData         []byte
+	icons            [2]uintptr
+	trays            map[uint32]*windowsTray
+	nextTrayID       uint32
+	activeTrayMenu   *windowsTray
+	environment      *comObject
+	controller       *comObject
+	webview          *comObject
+	activeDialog     *comObject
+	dialogActive     atomic.Bool
+	titleMenuPending atomic.Bool
+	modalActive      int
+	quitAfterModal   bool
+	quitting         bool
+	printActive      bool
+	callbacks        []*comCallback
+	eventTokens      []eventToken
+	generation       uint64
+	pageCtx          context.Context
+	pageCancel       context.CancelFunc
+	calls            *callQueue
+	pendingEvents    []string
+	resources        map[*comObject]resourceRequest
+	temporary        temporaryDirectory
+	initializing     bool
+	onCloseReady     atomic.Bool
+	initialLoaded    bool
+	contentCommitted bool
+	ready            bool
+	shown            bool
+	hidden           bool
+	closing          bool
+	closePending     bool
+	closeRequested   bool
+	closed           bool
+	err              error
 }
 
 // queuedCall 保存主线程操作及关闭时的资源回收操作
@@ -165,7 +202,7 @@ type queuedCall struct {
 	discard func()
 }
 
-// wide 编码已校验的系统字符串
+// wide 过滤空字符并将字符串编码为UTF16指针
 // 入参: s 字符串
 // 返回: *uint16 UTF16字符串
 func wide(s string) *uint16 {
@@ -215,114 +252,235 @@ func comString(object *comObject, index int) (string, error) {
 		return "", nil
 	}
 	defer ole32.NewProc("CoTaskMemFree").Call(uintptr(unsafe.Pointer(p)))
-	return utf16String(p), nil
+	return windows.UTF16PtrToString(p), nil
 }
 
-// utf16String 读取零结尾UTF16字符串
-// 入参: p 字符串指针
-// 返回: string 字符串
-func utf16String(p *uint16) string {
-	if p == nil {
-		return ""
-	}
-	var b []uint16
-	for i := uintptr(0); ; i++ {
-		c := *(*uint16)(unsafe.Add(unsafe.Pointer(p), i*2))
-		if c == 0 {
-			break
+// addRefPositive 仅在引用计数大于零时原子递增，拒绝已归零对象复活
+// 入参: refs 原子引用计数
+// 返回: int32 新引用计数，已归零返回零
+func addRefPositive(refs *atomic.Int32) int32 {
+	for {
+		current := refs.Load()
+		if current <= 0 {
+			return 0
 		}
-		b = append(b, c)
+		if refs.CompareAndSwap(current, current+1) {
+			return current + 1
+		}
 	}
-	return syscall.UTF16ToString(b)
 }
 
-// callbackQuery 提供IUnknown和指定回调接口
-// 入参: c 回调对象, iid 接口标识, out 接口输出
+// releaseRefPositive 仅在引用计数大于零时原子递减
+// 入参: refs 原子引用计数
+// 返回: int32 递减后的引用计数, bool 是否实际递减
+func releaseRefPositive(refs *atomic.Int32) (int32, bool) {
+	for {
+		current := refs.Load()
+		if current <= 0 {
+			return 0, false
+		}
+		if refs.CompareAndSwap(current, current-1) {
+			return current - 1, true
+		}
+	}
+}
+
+// callbackQuery 提供IUnknown和指定回调接口并隔离异常
+// 入参: self 回调地址, iid 接口标识, out 接口输出
 // 返回: uintptr HRESULT结果
-func callbackQuery(c *comCallback, iid *syscall.GUID, out **comCallback) uintptr {
-	if out == nil {
-		return 0x80004003
-	}
-	*out = nil
-	g := *iid
-	unknown := syscall.GUID{Data4: [8]byte{0xc0, 0, 0, 0, 0, 0, 0, 0x46}}
-	if g != unknown && g != c.IID {
-		return 0x80004002
-	}
-	*out = c
-	c.Refs.Add(1)
-	return 0
-}
-
-// callbackAdd 增加回调引用
-// 入参: c 回调对象
-// 返回: uintptr 引用计数
-func callbackAdd(c *comCallback) uintptr {
-	return uintptr(c.Refs.Add(1))
-}
-
-// callbackRelease 释放回调引用与全局根
-// 入参: c 回调对象
-// 返回: uintptr 引用计数
-func callbackRelease(c *comCallback) uintptr {
-	n := c.Refs.Add(-1)
-	if n <= 0 {
-		callbackRoots.Delete(uintptr(unsafe.Pointer(c)))
-		return 0
-	}
-	return uintptr(n)
-}
-
-// callbackInvoke 调度回调并隔离异常
-// 入参: c 回调对象, a 数值参数, b 对象参数
-// 返回: uintptr HRESULT结果
-func callbackInvoke(c *comCallback, a uintptr, b *comObject) (result uintptr) {
+func callbackQuery(self uintptr, iid *syscall.GUID, out *uintptr) (result uintptr) {
 	defer func() {
 		if recover() != nil {
 			result = 0x80004005
 		}
 	}()
+	if out == nil || iid == nil {
+		return 0x80004003
+	}
+	*out = 0
+	value, ok := callbackRoots.Load(self)
+	if !ok {
+		return 0x80004005
+	}
+	c := value.(*comCallback)
+	g := *iid
+	if g != iidUnknown && g != c.IID {
+		return 0x80004002
+	}
+	if addRefPositive(&c.Refs) == 0 {
+		return 0x80004005
+	}
+	*out = self
+	return 0
+}
+
+// callbackAdd 增加回调引用
+// 入参: self 回调地址
+// 返回: uintptr 引用计数
+func callbackAdd(self uintptr) (result uintptr) {
+	defer func() {
+		if recover() != nil {
+			result = 0
+		}
+	}()
+	value, ok := callbackRoots.Load(self)
+	if !ok {
+		return 0
+	}
+	return uintptr(addRefPositive(&value.(*comCallback).Refs))
+}
+
+// callbackRelease 释放回调引用并在归零命中时取消固定
+// 入参: self 回调地址
+// 返回: uintptr 引用计数
+func callbackRelease(self uintptr) (result uintptr) {
+	defer func() {
+		if recover() != nil {
+			result = 0
+		}
+	}()
+	value, ok := callbackRoots.Load(self)
+	if !ok {
+		return 0
+	}
+	c := value.(*comCallback)
+	n, decremented := releaseRefPositive(&c.Refs)
+	if !decremented {
+		return 0
+	}
+	if n == 0 {
+		if _, loaded := callbackRoots.LoadAndDelete(self); loaded {
+			c.pin.Unpin()
+		}
+		return 0
+	}
+	return uintptr(n)
+}
+
+// releaseCallback 释放Go侧持有的回调引用
+// 入参: c 回调对象
+func releaseCallback(c *comCallback) {
+	if c != nil {
+		callbackRelease(uintptr(unsafe.Pointer(c)))
+	}
+}
+
+// callbackInvoke 调度COM对象参数回调并隔离异常
+// 入参: self 回调地址, a 数值参数, b COM对象参数
+// 返回: uintptr HRESULT结果
+func callbackInvoke(self, a uintptr, b *comObject) (result uintptr) {
+	defer func() {
+		if recover() != nil {
+			result = 0x80004005
+		}
+	}()
+	value, ok := callbackRoots.Load(self)
+	if !ok {
+		return 0x80004005
+	}
+	c := value.(*comCallback)
+	if c.Fn == nil {
+		return 0
+	}
 	return c.Fn(a, b)
 }
 
-// newCallback 创建初始引用计数为1的一次性COM回调
+// scalarCallbackInvoke 调度标量或非COM指针参数回调并隔离异常，满足checkptr对齐检查
+// 入参: self 回调地址, a 第一参数, b 第二参数
+// 返回: uintptr HRESULT结果
+func scalarCallbackInvoke(self, a, b uintptr) (result uintptr) {
+	defer func() {
+		if recover() != nil {
+			result = 0x80004005
+		}
+	}()
+	value, ok := callbackRoots.Load(self)
+	if !ok {
+		return 0x80004005
+	}
+	c := value.(*comCallback)
+	if c.ScalarFn == nil {
+		return 0
+	}
+	return c.ScalarFn(a, b)
+}
+
+// newCallback 创建初始引用计数为1并固定的COM对象参数回调
 // 入参: iid 接口标识, fn 回调函数
 // 返回: *comCallback 回调对象, uintptr 回调地址
 func newCallback(iid string, fn func(uintptr, *comObject) uintptr) (*comCallback, uintptr) {
-	var g syscall.GUID
-	ole32.NewProc("CLSIDFromString").Call(uintptr(unsafe.Pointer(wide(iid))), uintptr(unsafe.Pointer(&g)))
-	c := &comCallback{Table: &callbackTable, IID: g, Fn: fn}
+	c := &comCallback{Table: &callbackTable, IID: guid(iid), Fn: fn}
 	c.Refs.Store(1)
+	c.pin.Pin(c)
 	p := uintptr(unsafe.Pointer(c))
 	callbackRoots.Store(p, c)
 	return c, p
 }
 
-// callback 注册随窗口生命周期释放的COM回调
+// newScalarCallback 创建初始引用计数为1并固定的COM标量参数回调
 // 入参: iid 接口标识, fn 回调函数
-// 返回: uintptr 回调地址
-func (n *nativeWindow) callback(iid string, fn func(uintptr, *comObject) uintptr) uintptr {
-	c, p := newCallback(iid, fn)
-	n.callbacks = append(n.callbacks, c)
-	return p
+// 返回: *comCallback 回调对象, uintptr 回调地址
+func newScalarCallback(iid string, fn func(uintptr, uintptr) uintptr) (*comCallback, uintptr) {
+	c := &comCallback{Table: &scalarCallbackTable, IID: guid(iid), ScalarFn: fn}
+	c.Refs.Store(1)
+	c.pin.Pin(c)
+	p := uintptr(unsafe.Pointer(c))
+	callbackRoots.Store(p, c)
+	return c, p
+}
+
+// buildWindowsBridgeScript 构造带随机凭据隔离的Windows文档初始化脚本
+// 入参: token 仅向顶层宿主页面注入的随机凭据, dropEnabled 是否启用文件拖放桥接
+// 返回: string 文档初始化脚本
+func buildWindowsBridgeScript(token string, dropEnabled bool) string {
+	encoded := bridgeScriptQuoted(token)
+	drop := "false"
+	if dropEnabled {
+		drop = "true"
+	}
+	return strings.Join([]string{
+		`(() => {`,
+		`if (location.origin !== "` + resourceOrigin + `" || window !== window.top) return;`,
+		`const bridgeToken = ` + encoded + `;`,
+		`const dropEnabled = ` + drop + `;`,
+		`const webview = chrome.webview;`,
+		`const transport = {`,
+		`postMessage: message => webview.postMessage({...message, token: bridgeToken}),`,
+		`addEventListener: (name, listener) => webview.addEventListener(name, listener),`,
+		`postMessageWithAdditionalObjects: webview.postMessageWithAdditionalObjects ? (message, files) => webview.postMessageWithAdditionalObjects({...message, token: bridgeToken}, files) : null`,
+		`};`,
+		bridgeScriptCore,
+		`})();`,
+	}, "\n")
 }
 
 // run 创建窗口和WebView2并处理原生消息
 // 入参: parent 运行上下文, o 宿主选项
 // 返回: error 启动或运行错误
 func run(parent context.Context, o Options) error {
-	n := &nativeWindow{options: o, done: make(chan struct{})}
+	n := &nativeWindow{options: o, title: o.Title, bridgeToken: rand.Text(), done: make(chan struct{})}
 	if !active.CompareAndSwap(nil, n) {
-		return errors.New("another Run is active")
+		return ErrAlreadyRunning
 	}
 	defer func() {
-		if n.hwnd != 0 && o.OnClose != nil {
+		if n.onCloseReady.Load() && o.OnClose != nil {
 			o.OnClose()
 		}
 	}()
 	defer active.Store(nil)
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	tid, _, _ := kernel32.NewProc("GetCurrentThreadId").Call()
+	n.threadID = uint32(tid)
+	defer func() {
+		var msg message
+		for {
+			ok, _, _ := user32.NewProc("PeekMessageW").Call(uintptr(unsafe.Pointer(&msg)), 0, 0x12, 0x12, 1)
+			if ok == 0 {
+				break
+			}
+		}
+	}()
 	if proc := user32.NewProc("SetThreadDpiAwarenessContext"); proc.Find() == nil {
 		old, _, err := proc.Call(^uintptr(3))
 		if old == 0 {
@@ -339,9 +497,14 @@ func run(parent context.Context, o Options) error {
 	}
 	n.ctx, n.cancel = context.WithCancel(parent)
 	defer n.temporary.close()
-	defer n.cancel()
+	defer func() {
+		n.cancel()
+		n.readyWG.Wait()
+		n.titleBarWG.Wait()
+	}()
 	if o.OnTitleBarChanged != nil {
 		n.titleBarEvents = make(chan TitleBarInfo, 1)
+		n.titleBarWG.Add(1)
 		go n.deliverTitleBarChanges()
 	}
 	hr, _, _ := ole32.NewProc("CoInitializeEx").Call(0, 2)
@@ -349,8 +512,8 @@ func run(parent context.Context, o Options) error {
 		return err
 	}
 	defer func() {
-		ole32.NewProc("CoUninitialize").Call()
 		releaseRuntimes()
+		ole32.NewProc("CoUninitialize").Call()
 	}()
 	if err := parent.Err(); err != nil {
 		return err
@@ -361,12 +524,9 @@ func run(parent context.Context, o Options) error {
 	}
 	create, err := dll.FindProc("CreateWebViewEnvironmentWithOptionsInternal")
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrRuntimeUnavailable, err)
 	}
 	if o.UserDataDir == "" {
-		if o.AppID == "" {
-			return errors.New("AppID or UserDataDir is required")
-		}
 		o.UserDataDir, err = DefaultUserDataDir(o.AppID)
 		if err != nil {
 			return err
@@ -387,7 +547,8 @@ func run(parent context.Context, o Options) error {
 	defer func() { destroyIcons(n.icons) }()
 	instance, _, _ := kernel32.NewProc("GetModuleHandleW").Call(0)
 	cursor, _, _ := user32.NewProc("LoadCursorW").Call(0, 32512)
-	class := windowClass{Style: 8, Proc: wndCallback, Instance: instance, Cursor: cursor, Name: wide("GUIGo.Native.Window")}
+	className := wide("GUIGo.Native.Window")
+	class := windowClass{Style: 8, Proc: wndCallback, Instance: instance, Cursor: cursor, Name: className}
 	if o.TitleBar == TitleBarContent {
 		class.Background, _, _ = gdi32.NewProc("GetStockObject").Call(4)
 	}
@@ -396,13 +557,18 @@ func run(parent context.Context, o Options) error {
 	if atom == 0 && e != syscall.Errno(1410) {
 		return e
 	}
-	defer user32.NewProc("UnregisterClassW").Call(uintptr(unsafe.Pointer(class.Name)), instance)
+	if atom != 0 {
+		defer func() {
+			user32.NewProc("UnregisterClassW").Call(atom, instance)
+		}()
+	}
 	style := n.style()
 	r := rect{Right: n.pixels(o.Width), Bottom: n.pixels(o.Height)}
 	if err := n.adjustRect(&r); err != nil {
 		return err
 	}
-	n.hwnd, _, e = user32.NewProc("CreateWindowExW").Call(0, uintptr(unsafe.Pointer(class.Name)), uintptr(unsafe.Pointer(wide(o.Title))), style, 0x80000000, 0x80000000, uintptr(r.Right-r.Left), uintptr(r.Bottom-r.Top), 0, 0, instance, 0)
+	n.hwnd, _, e = user32.NewProc("CreateWindowExW").Call(0, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(wide(o.Title))), style, 0x80000000, 0x80000000, uintptr(r.Right-r.Left), uintptr(r.Bottom-r.Top), 0, 0, instance, 0)
+	runtime.KeepAlive(className)
 	if n.hwnd == 0 {
 		return e
 	}
@@ -433,6 +599,12 @@ func run(parent context.Context, o Options) error {
 		for args := range n.resources {
 			n.finishResource(args)
 		}
+		if n.webview != nil {
+			for _, item := range n.eventTokens {
+				com(n.webview, item.removeIndex, uintptr(item.token))
+			}
+		}
+		n.eventTokens = nil
 		if n.controller != nil {
 			com(n.controller, 24)
 		}
@@ -442,6 +614,11 @@ func run(parent context.Context, o Options) error {
 		n.webview = nil
 		n.controller = nil
 		n.environment = nil
+		if o.Instance != nil {
+			if entry, ok := o.Instance.listener.(*windowInstance); ok {
+				entry.detachWindow(n)
+			}
+		}
 		if o.AppID != "" {
 			_ = n.setAppID("")
 		}
@@ -452,7 +629,7 @@ func run(parent context.Context, o Options) error {
 			kernel32.NewProc("CloseHandle").Call(browser)
 		}
 		for _, c := range n.callbacks {
-			callbackRelease(c)
+			releaseCallback(c)
 		}
 		n.callbacks = nil
 	}()
@@ -466,7 +643,6 @@ func run(parent context.Context, o Options) error {
 			if err := entry.attachWindow(n); err != nil {
 				return err
 			}
-			defer entry.Close()
 		}
 	}
 	if err := n.initializeDPI(); err != nil {
@@ -478,8 +654,13 @@ func run(parent context.Context, o Options) error {
 	if err := n.updateIcons(); err != nil {
 		return err
 	}
-	shell32.NewProc("DragAcceptFiles").Call(n.hwnd, 1)
+	if o.OnDrop != nil {
+		shell32.NewProc("DragAcceptFiles").Call(n.hwnd, 1)
+	}
 	envObj, envCB := newCallback("{4E8A3389-C9D8-4BD2-B6B5-124FEE6CC14D}", func(hr uintptr, env *comObject) uintptr {
+		if n.closed {
+			return 0
+		}
 		if n.ctx.Err() != nil {
 			n.initializing = false
 			n.fail(n.ctx.Err())
@@ -487,7 +668,12 @@ func run(parent context.Context, o Options) error {
 		}
 		if err := hresult(hr); err != nil {
 			n.initializing = false
-			n.fail(err)
+			n.fail(fmt.Errorf("%w: %w", ErrRuntimeUnavailable, err))
+			return 0
+		}
+		if env == nil {
+			n.initializing = false
+			n.fail(ErrRuntimeUnavailable)
 			return 0
 		}
 		n.environment = env
@@ -497,17 +683,25 @@ func run(parent context.Context, o Options) error {
 			err = checkRuntimeVersion(version)
 		}
 		if err != nil {
+			n.initializing = false
 			n.fail(err)
 			return 0
 		}
 		ctrlObj, cb := newCallback("{6C4819F3-C9B7-4260-8127-C9F5BDE7F68C}", func(hr uintptr, controller *comObject) uintptr {
 			n.initializing = false
+			if n.closed {
+				return 0
+			}
 			if n.ctx.Err() != nil {
 				n.fail(n.ctx.Err())
 				return 0
 			}
 			if err := hresult(hr); err != nil {
 				n.fail(err)
+				return 0
+			}
+			if controller == nil {
+				n.fail(ErrRuntimeUnavailable)
 				return 0
 			}
 			n.controller = controller
@@ -526,17 +720,19 @@ func run(parent context.Context, o Options) error {
 			parent = n.contentWindow
 		}
 		err = hresult(com(env, 3, parent, cb))
-		callbackRelease(ctrlObj)
+		releaseCallback(ctrlObj)
 		if err != nil {
+			n.initializing = false
 			n.fail(err)
 		}
 		return 0
 	})
 	n.initializing = true
 	hr, _, _ = create.Call(1, runtimeType, uintptr(unsafe.Pointer(wide(o.UserDataDir))), 0, envCB)
-	callbackRelease(envObj)
+	releaseCallback(envObj)
 	if err := hresult(hr); err != nil {
-		return fmt.Errorf("create WebView2 (install Microsoft WebView2 Runtime): %w", err)
+		n.initializing = false
+		return fmt.Errorf("%w: create WebView2 (install Microsoft WebView2 Runtime): %w", ErrRuntimeUnavailable, err)
 	}
 	go func() {
 		select {
@@ -567,6 +763,205 @@ func run(parent context.Context, o Options) error {
 	return parent.Err()
 }
 
+// waitBrowserExit 在清理阶段继续处理消息并限时等待浏览器进程退出
+// 入参: process 浏览器进程句柄
+func waitBrowserExit(process uintptr) {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return
+		}
+		timeout := uint32(remaining / time.Millisecond)
+		if timeout == 0 {
+			timeout = 1
+		}
+		status, _, _ := user32.NewProc("MsgWaitForMultipleObjects").Call(1, uintptr(unsafe.Pointer(&process)), 0, uintptr(timeout), 0x4ff)
+		if status == 0 || status == 0x102 || status == 0xffffffff {
+			return
+		}
+		var msg message
+		for {
+			ok, _, _ := user32.NewProc("PeekMessageW").Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0, 1)
+			if ok == 0 {
+				break
+			}
+			if msg.Message != 0x12 {
+				user32.NewProc("TranslateMessage").Call(uintptr(unsafe.Pointer(&msg)))
+				user32.NewProc("DispatchMessageW").Call(uintptr(unsafe.Pointer(&msg)))
+			}
+		}
+	}
+}
+
+// centerPosition 计算工作区内的可见窗口位置，保留负坐标显示器原点
+// 入参: bounds 可见边框, work 显示器工作区
+// 返回: point 窗口左上角坐标
+func centerPosition(bounds, work rect) point {
+	return point{
+		X: work.Left + max(0, (work.Right-work.Left-(bounds.Right-bounds.Left))/2),
+		Y: work.Top + max(0, (work.Bottom-work.Top-(bounds.Bottom-bounds.Top))/2),
+	}
+}
+
+// windowProc 处理Win32消息
+// 入参: hwnd 窗口句柄, msg 消息类型, wparam 消息参数, lparam 消息参数
+// 返回: uintptr 消息处理结果
+func windowProc(hwnd, msg, wparam, lparam uintptr) uintptr {
+	n := active.Load()
+	if n != nil {
+		if n.trayProc(msg, wparam, lparam) {
+			return 0
+		}
+		if result, handled := n.titleBarProc(hwnd, msg, wparam, lparam); handled {
+			return result
+		}
+		switch msg {
+		case 0x14:
+			if n.options.WindowMaterial != WindowSolid {
+				var bounds rect
+				user32.NewProc("GetClientRect").Call(hwnd, uintptr(unsafe.Pointer(&bounds)))
+				brush, _, _ := gdi32.NewProc("GetStockObject").Call(4)
+				user32.NewProc("FillRect").Call(wparam, uintptr(unsafe.Pointer(&bounds)), brush)
+				return 1
+			}
+		case 0x8001:
+			n.mu.Lock()
+			q := n.queue
+			n.queue = nil
+			n.mu.Unlock()
+			for _, fn := range q {
+				fn.run()
+			}
+			return 0
+		case 5:
+			n.resize()
+			return 0
+		case 3:
+			if n.controller != nil {
+				com(n.controller, 23)
+			}
+		case 6:
+			if wparam&0xffff != 0 && n.options.Instance != nil {
+				if entry, ok := n.options.Instance.listener.(*windowInstance); ok {
+					entry.recordActivation(hwnd)
+				}
+			}
+		case 0x10:
+			n.requestClose()
+			return 0
+		case 0x2e0:
+			dpi := uint32(wparam & 0xffff)
+			if dpi == 0 {
+				dpi = uint32(wparam >> 16)
+			}
+			if dpi != 0 {
+				n.dpi = dpi
+			}
+			if lparam != 0 {
+				r := *(**rect)(unsafe.Pointer(&lparam))
+				user32.NewProc("SetWindowPos").Call(hwnd, 0, uintptr(r.Left), uintptr(r.Top), uintptr(r.Right-r.Left), uintptr(r.Bottom-r.Top), 0x14)
+			}
+			if err := n.updateIcons(); err != nil {
+				n.reportError(err)
+			}
+			n.updateTrayIcons()
+			n.resize()
+			return 0
+		case 0x24:
+			if lparam == 0 {
+				return 0
+			}
+			info := *(**[5]point)(unsafe.Pointer(&lparam))
+			o := n.options
+			minw, minh, maxw, maxh := o.MinWidth, o.MinHeight, o.MaxWidth, o.MaxHeight
+			if o.FixedSize {
+				minw = o.Width
+				maxw = o.Width
+				minh = o.Height
+				maxh = o.Height
+			}
+			r := rect{}
+			if err := n.adjustRect(&r); err != nil {
+				n.fail(err)
+				return 0
+			}
+			dx, dy := r.Right-r.Left, r.Bottom-r.Top
+			if minw > 0 {
+				info[3].X = n.pixels(minw) + dx
+			}
+			if minh > 0 {
+				info[3].Y = n.pixels(minh) + dy
+			}
+			if maxw > 0 {
+				info[4].X = n.pixels(maxw) + dx
+				if info[1].X > info[4].X {
+					info[1].X = info[4].X
+				}
+			}
+			if maxh > 0 {
+				info[4].Y = n.pixels(maxh) + dy
+				if info[1].Y > info[4].Y {
+					info[1].Y = info[4].Y
+				}
+			}
+			return 0
+		case 0x233:
+			count, _, _ := shell32.NewProc("DragQueryFileW").Call(wparam, 0xffffffff, 0, 0)
+			if count == 0 || n.options.OnDrop == nil {
+				shell32.NewProc("DragFinish").Call(wparam)
+				return 0
+			}
+			paths := make([]string, 0, count)
+			for i := uintptr(0); i < count; i++ {
+				size, _, _ := shell32.NewProc("DragQueryFileW").Call(wparam, i, 0, 0)
+				if size == 0 {
+					continue
+				}
+				b := make([]uint16, size+1)
+				shell32.NewProc("DragQueryFileW").Call(wparam, i, uintptr(unsafe.Pointer(&b[0])), size+1)
+				if path := syscall.UTF16ToString(b); path != "" {
+					paths = append(paths, path)
+				}
+			}
+			shell32.NewProc("DragFinish").Call(wparam)
+			if len(paths) > 0 {
+				go func() {
+					defer func() {
+						if v := recover(); v != nil {
+							n.reportError(fmt.Errorf("OnDrop panic: %v", v))
+						}
+					}()
+					n.options.OnDrop(paths)
+				}()
+			}
+			return 0
+		}
+	}
+	r, _, _ := user32.NewProc("DefWindowProcW").Call(hwnd, msg, wparam, lparam)
+	return r
+}
+
+// openURL 调用系统浏览器并返回ShellExecute失败信息
+// 入参: raw 外部地址
+// 返回: error 打开错误
+func openURL(raw string) error {
+	result, _, _ := shell32.NewProc("ShellExecuteW").Call(0, uintptr(unsafe.Pointer(wide("open"))), uintptr(unsafe.Pointer(wide(raw))), 0, 0, 1)
+	if result <= 32 {
+		return fmt.Errorf("open external URL failed (%d)", result)
+	}
+	return nil
+}
+
+// callback 注册随窗口生命周期释放的COM对象参数回调
+// 入参: iid 接口标识, fn 回调函数
+// 返回: uintptr 回调地址
+func (n *nativeWindow) callback(iid string, fn func(uintptr, *comObject) uintptr) uintptr {
+	c, p := newCallback(iid, fn)
+	n.callbacks = append(n.callbacks, c)
+	return p
+}
+
 // activate 恢复最小化窗口并请求前台激活
 // 返回: error 请求投递错误
 func (n *nativeWindow) activate() error {
@@ -575,10 +970,11 @@ func (n *nativeWindow) activate() error {
 		iconic, _, _ := user32.NewProc("IsIconic").Call(n.hwnd)
 		if iconic != 0 {
 			user32.NewProc("ShowWindow").Call(n.hwnd, 9)
+			user32.NewProc("SetForegroundWindow").Call(n.hwnd)
 		} else if n.shown || n.ready {
 			n.show()
+			user32.NewProc("SetForegroundWindow").Call(n.hwnd)
 		}
-		user32.NewProc("SetForegroundWindow").Call(n.hwnd)
 	})
 }
 
@@ -626,7 +1022,9 @@ func (n *nativeWindow) setAppID(appID string) error {
 		value.Type = 31
 		value.Text = wide(appID)
 	}
-	return hresult(com(store, 6, uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&value))))
+	hr = com(store, 6, uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&value)))
+	runtime.KeepAlive(value.Text)
+	return hresult(hr)
 }
 
 // drainTop 仅在最外层消息循环运行模态操作，避免重入WebView2回调
@@ -636,21 +1034,35 @@ func (n *nativeWindow) drainTop() {
 	n.topQueue = nil
 	n.mu.Unlock()
 	for _, fn := range queue {
+		if n.closed || n.quitting {
+			return
+		}
 		fn()
 	}
 }
 
-// invokeTop 等待最外层消息循环执行操作，不在WndProc或COM回调栈显示模态窗口
-// 入参: fn 待执行操作
+// invokeTop 等待最外层消息循环执行操作，不在WndProc或COM回调栈显示模态窗口，排队阶段响应上下文取消
+// 入参: ctx 调用上下文, fn 待执行操作
 // 返回: error 执行错误
-func (n *nativeWindow) invokeTop(fn func() error) error {
+func (n *nativeWindow) invokeTop(ctx context.Context, fn func() error) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
 	result := make(chan error, 1)
+	var state atomic.Int32
 	n.mu.Lock()
 	if n.closed {
 		n.mu.Unlock()
 		return ErrClosed
 	}
-	n.topQueue = append(n.topQueue, func() { result <- fn() })
+	n.topQueue = append(n.topQueue, func() {
+		if !state.CompareAndSwap(0, 1) {
+			return
+		}
+		result <- fn()
+	})
 	ok, _, err := user32.NewProc("PostMessageW").Call(n.hwnd, 0x8002, 0, 0)
 	if ok == 0 {
 		n.topQueue = n.topQueue[:len(n.topQueue)-1]
@@ -658,33 +1070,29 @@ func (n *nativeWindow) invokeTop(fn func() error) error {
 		return err
 	}
 	n.mu.Unlock()
+	if ctx == nil {
+		select {
+		case err := <-result:
+			return err
+		case <-n.done:
+			return ErrClosed
+		}
+	}
 	select {
 	case err := <-result:
 		return err
+	case <-ctx.Done():
+		if state.CompareAndSwap(0, 2) {
+			return ctx.Err()
+		}
+		select {
+		case err := <-result:
+			return err
+		case <-n.done:
+			return ErrClosed
+		}
 	case <-n.done:
 		return ErrClosed
-	}
-}
-
-// waitBrowserExit 在清理阶段继续处理COM消息并等待浏览器释放用户目录
-// 入参: process 浏览器进程句柄
-func waitBrowserExit(process uintptr) {
-	for i := 0; i < 50; i++ {
-		status, _, _ := user32.NewProc("MsgWaitForMultipleObjects").Call(1, uintptr(unsafe.Pointer(&process)), 0, 100, 0x4ff)
-		if status == 0 {
-			return
-		}
-		var msg message
-		for {
-			ok, _, _ := user32.NewProc("PeekMessageW").Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0, 1)
-			if ok == 0 {
-				break
-			}
-			if msg.Message != 0x12 {
-				user32.NewProc("TranslateMessage").Call(uintptr(unsafe.Pointer(&msg)))
-				user32.NewProc("DispatchMessageW").Call(uintptr(unsafe.Pointer(&msg)))
-			}
-		}
 	}
 }
 
@@ -697,14 +1105,39 @@ func (n *nativeWindow) style() uintptr {
 	return 0x00CF0000
 }
 
-// fail 保存初始化错误并退出消息循环
-// 入参: err 运行错误
-func (n *nativeWindow) fail(err error) {
-	n.err = err
+// leaveModal 退出嵌套模态循环并在需要时补发主循环退出消息
+func (n *nativeWindow) leaveModal() {
+	n.modalActive--
+	if n.modalActive == 0 && n.quitAfterModal {
+		n.quitAfterModal = false
+		user32.NewProc("PostQuitMessage").Call(0)
+	}
+}
+
+// postQuit 关闭活动菜单与对话框并退出主消息循环，存在嵌套模态循环时延迟退出
+func (n *nativeWindow) postQuit() {
+	n.quitting = true
 	if n.activeTrayMenu != nil {
 		n.activeTrayMenu.endMenu()
 	}
+	user32.NewProc("EndMenu").Call()
+	if n.activeDialog != nil {
+		closeFileDialog(n.activeDialog)
+	}
+	if n.modalActive > 0 {
+		n.quitAfterModal = true
+		return
+	}
 	user32.NewProc("PostQuitMessage").Call(0)
+}
+
+// fail 在STA主线程保存首个致命错误并退出消息循环
+// 入参: err 运行错误
+func (n *nativeWindow) fail(err error) {
+	if n.err == nil {
+		n.err = err
+	}
+	n.postQuit()
 }
 
 // reportError 异步向宿主报告非致命运行错误
@@ -762,13 +1195,16 @@ func (n *nativeWindow) close() error {
 
 // emit 投递JSON消息
 // 入参: raw 消息文本
-// 返回: error 投递错误
+// 返回: error 队列上限或投递错误
 func (n *nativeWindow) emit(raw string) error {
 	return n.invoke(func() error {
 		if n.webview == nil {
 			return errors.New("webview not ready")
 		}
 		if !n.ready {
+			if len(n.pendingEvents) >= maxPendingEvents {
+				return errors.New("too many pending events")
+			}
 			n.pendingEvents = append(n.pendingEvents, raw)
 			return nil
 		}
@@ -776,7 +1212,16 @@ func (n *nativeWindow) emit(raw string) error {
 	})
 }
 
-// setTitle 设置原生标题
+// currentTitle 读取当前窗口标题副本
+// 返回: string 当前窗口标题
+func (n *nativeWindow) currentTitle() string {
+	n.mu.Lock()
+	title := n.title
+	n.mu.Unlock()
+	return title
+}
+
+// setTitle 设置原生标题并更新标题缓存
 // 入参: title 窗口标题
 // 返回: error 设置错误
 func (n *nativeWindow) setTitle(title string) error {
@@ -785,6 +1230,9 @@ func (n *nativeWindow) setTitle(title string) error {
 		if r == 0 {
 			return e
 		}
+		n.mu.Lock()
+		n.title = title
+		n.mu.Unlock()
 		return nil
 	})
 }
@@ -842,8 +1290,8 @@ func (n *nativeWindow) center(monitor uintptr) error {
 	}
 	var frame rect
 	hr, _, _ := dwmapi.NewProc("DwmGetWindowAttribute").Call(n.hwnd, 9, uintptr(unsafe.Pointer(&frame)), unsafe.Sizeof(frame))
-	if err := hresult(hr); err != nil {
-		return err
+	if hresult(hr) != nil || frame.Right <= frame.Left || frame.Bottom <= frame.Top {
+		frame = bounds
 	}
 	border := rect{Left: frame.Left - bounds.Left, Top: frame.Top - bounds.Top, Right: bounds.Right - frame.Right, Bottom: bounds.Bottom - frame.Bottom}
 	if !n.options.FixedSize {
@@ -861,35 +1309,17 @@ func (n *nativeWindow) center(monitor uintptr) error {
 	return nil
 }
 
-// centerPosition 计算工作区内的可见窗口位置，保留负坐标显示器原点
-// 入参: bounds 可见边框, work 显示器工作区
-// 返回: point 窗口左上角坐标
-func centerPosition(bounds, work rect) point {
-	return point{
-		X: work.Left + max(0, (work.Right-work.Left-(bounds.Right-bounds.Left))/2),
-		Y: work.Top + max(0, (work.Bottom-work.Top-(bounds.Bottom-bounds.Top))/2),
-	}
-}
-
-// setClientSize 在宿主线程应用逻辑客户区尺寸及约束
+// setClientSize 在STA线程应用逻辑客户区尺寸及约束
 // 入参: w 客户区宽度, h 客户区高度
 // 返回: error 调整错误
 func (n *nativeWindow) setClientSize(w, h int) error {
-	o := n.options
-	o.Width = w
-	o.Height = h
-	if w <= 0 || h <= 0 {
-		return errors.New("invalid size")
-	}
-	if err := validate(&o); err != nil {
-		return err
-	}
-	r := rect{Right: n.pixels(o.Width), Bottom: n.pixels(o.Height)}
+	width, height := clampWindowSize(n.options, w, h)
+	r := rect{Right: n.pixels(width), Bottom: n.pixels(height)}
 	if err := n.adjustRect(&r); err != nil {
 		return err
 	}
 	previousWidth, previousHeight := n.options.Width, n.options.Height
-	n.options.Width, n.options.Height = o.Width, o.Height
+	n.options.Width, n.options.Height = width, height
 	ok, _, e := user32.NewProc("SetWindowPos").Call(n.hwnd, 0, 0, 0, uintptr(r.Right-r.Left), uintptr(r.Bottom-r.Top), 0x16)
 	if ok == 0 {
 		n.options.Width, n.options.Height = previousWidth, previousHeight
@@ -902,7 +1332,7 @@ func (n *nativeWindow) setClientSize(w, h int) error {
 func (n *nativeWindow) resize() {
 	if n.contentWindow != 0 {
 		if err := n.layoutTitleBar(); err != nil {
-			n.fail(err)
+			n.reportError(err)
 		}
 	}
 	if n.controller != nil {
@@ -917,116 +1347,7 @@ func (n *nativeWindow) resize() {
 	n.scheduleTitleBarChange()
 }
 
-// windowProc 处理Win32消息
-// 入参: hwnd 窗口句柄, msg 消息类型, wparam 消息参数, lparam 消息参数
-// 返回: uintptr 消息处理结果
-func windowProc(hwnd, msg, wparam, lparam uintptr) uintptr {
-	n := active.Load()
-	if n != nil {
-		if n.trayProc(msg, wparam, lparam) {
-			return 0
-		}
-		if result, handled := n.titleBarProc(hwnd, msg, wparam, lparam); handled {
-			return result
-		}
-		switch msg {
-		case 0x14:
-			if n.options.WindowMaterial != WindowSolid {
-				var bounds rect
-				user32.NewProc("GetClientRect").Call(hwnd, uintptr(unsafe.Pointer(&bounds)))
-				brush, _, _ := gdi32.NewProc("GetStockObject").Call(4)
-				user32.NewProc("FillRect").Call(wparam, uintptr(unsafe.Pointer(&bounds)), brush)
-				return 1
-			}
-		case 0x8001:
-			n.mu.Lock()
-			q := n.queue
-			n.queue = nil
-			n.mu.Unlock()
-			for _, fn := range q {
-				fn.run()
-			}
-			return 0
-		case 5:
-			n.resize()
-			return 0
-		case 3:
-			if n.controller != nil {
-				com(n.controller, 23)
-			}
-		case 6:
-			if wparam&0xffff != 0 && n.options.Instance != nil {
-				recordInstanceActivation(hwnd)
-			}
-			n.scheduleTitleBarChange()
-		case 0x10:
-			n.requestClose()
-			return 0
-		case 0x2e0:
-			n.dpi = uint32(wparam & 0xffff)
-			r := *(**rect)(unsafe.Pointer(&lparam))
-			user32.NewProc("SetWindowPos").Call(hwnd, 0, uintptr(r.Left), uintptr(r.Top), uintptr(r.Right-r.Left), uintptr(r.Bottom-r.Top), 0x14)
-			if err := n.updateIcons(); err != nil && n.options.OnError != nil {
-				go n.options.OnError(err)
-			}
-			n.resize()
-			return 0
-		case 0x24:
-			info := *(**[5]point)(unsafe.Pointer(&lparam))
-			o := n.options
-			minw, minh, maxw, maxh := o.MinWidth, o.MinHeight, o.MaxWidth, o.MaxHeight
-			if o.FixedSize {
-				minw = o.Width
-				maxw = o.Width
-				minh = o.Height
-				maxh = o.Height
-			}
-			r := rect{}
-			if err := n.adjustRect(&r); err != nil {
-				n.fail(err)
-				return 0
-			}
-			dx, dy := r.Right-r.Left, r.Bottom-r.Top
-			if minw > 0 {
-				info[3].X = n.pixels(minw) + dx
-			}
-			if minh > 0 {
-				info[3].Y = n.pixels(minh) + dy
-			}
-			if maxw > 0 {
-				info[4].X = n.pixels(maxw) + dx
-				if info[1].X > info[4].X {
-					info[1].X = info[4].X
-				}
-			}
-			if maxh > 0 {
-				info[4].Y = n.pixels(maxh) + dy
-				if info[1].Y > info[4].Y {
-					info[1].Y = info[4].Y
-				}
-			}
-			return 0
-		case 0x233:
-			count, _, _ := shell32.NewProc("DragQueryFileW").Call(wparam, 0xffffffff, 0, 0)
-			paths := make([]string, 0, count)
-			for i := uintptr(0); i < count; i++ {
-				size, _, _ := shell32.NewProc("DragQueryFileW").Call(wparam, i, 0, 0)
-				b := make([]uint16, size+1)
-				shell32.NewProc("DragQueryFileW").Call(wparam, i, uintptr(unsafe.Pointer(&b[0])), size+1)
-				paths = append(paths, syscall.UTF16ToString(b))
-			}
-			shell32.NewProc("DragFinish").Call(wparam)
-			if n.options.OnDrop != nil {
-				go n.options.OnDrop(paths)
-			}
-			return 0
-		}
-	}
-	r, _, _ := user32.NewProc("DefWindowProcW").Call(hwnd, msg, wparam, lparam)
-	return r
-}
-
-// setup 注册资源与桥接并等待注入完成后导航
+// setup 注册资源与桥接并保存事件令牌，等待注入完成后导航
 // 返回: error 初始化错误
 func (n *nativeWindow) setup() error {
 	if err := n.initializeTitleBarZoom(); err != nil {
@@ -1039,29 +1360,51 @@ func (n *nativeWindow) setup() error {
 	if err := hresult(com(n.controller, 4, 1)); err != nil {
 		return err
 	}
-	var token int64
+	register := func(addIndex, removeIndex int, handler uintptr) error {
+		var token int64
+		if err := hresult(com(n.webview, addIndex, handler, uintptr(unsafe.Pointer(&token)))); err != nil {
+			return err
+		}
+		n.eventTokens = append(n.eventTokens, eventToken{removeIndex: removeIndex, token: token})
+		return nil
+	}
 	nav := n.callback("{9ADBE429-F36D-432B-9DDC-F8881FBD76E3}", func(_ uintptr, args *comObject) uintptr {
+		if n.closed || n.webview == nil || args == nil {
+			return 0
+		}
 		uri, err := comString(args, 3)
 		if err != nil || !localURL(uri) {
 			com(args, 8, 1)
 			if err == nil && externalURL(uri) {
 				n.external(uri)
 			}
-		} else {
-			n.generation++
-			if n.pageCancel != nil {
-				n.pageCancel()
-			}
-			n.pageCtx, n.pageCancel = context.WithCancel(n.ctx)
-			n.calls = newCallQueue(n.pageCtx)
-			n.ready = false
 		}
 		return 0
 	})
-	if err := hresult(com(n.webview, 7, nav, uintptr(unsafe.Pointer(&token)))); err != nil {
+	if err := register(7, 8, nav); err != nil {
+		return err
+	}
+	contentLoading := n.callback("{364471E7-F2BE-4910-BDBA-D72077D51C4B}", func(_ uintptr, args *comObject) uintptr {
+		if n.closed || n.webview == nil || args == nil {
+			return 0
+		}
+		n.generation++
+		if n.pageCancel != nil {
+			n.pageCancel()
+		}
+		n.pageCtx, n.pageCancel = context.WithCancel(n.ctx)
+		n.calls = newCallQueue(n.pageCtx)
+		n.ready = false
+		n.contentCommitted = true
+		return 0
+	})
+	if err := register(9, 10, contentLoading); err != nil {
 		return err
 	}
 	popup := n.callback("{D4C185FE-C81C-4989-97AF-2D3FA7AB5651}", func(_ uintptr, args *comObject) uintptr {
+		if n.closed || n.webview == nil || args == nil {
+			return 0
+		}
 		com(args, 6, 1)
 		uri, err := comString(args, 3)
 		if err == nil && externalURL(uri) && !localURL(uri) {
@@ -1069,10 +1412,13 @@ func (n *nativeWindow) setup() error {
 		}
 		return 0
 	})
-	if err := hresult(com(n.webview, 44, popup, uintptr(unsafe.Pointer(&token)))); err != nil {
+	if err := register(44, 45, popup); err != nil {
 		return err
 	}
 	msg := n.callback("{57213F19-00E6-49FA-8E07-898EA01ECBD2}", func(_ uintptr, args *comObject) uintptr {
+		if n.closed || n.webview == nil || args == nil {
+			return 0
+		}
 		source, err := comString(args, 3)
 		if err != nil || !localURL(source) {
 			return 0
@@ -1082,10 +1428,14 @@ func (n *nativeWindow) setup() error {
 			return 0
 		}
 		generation := n.generation
-		var message envelope
-		if json.Unmarshal([]byte(raw), &message) != nil {
+		var received struct {
+			envelope
+			Token string `json:"token"`
+		}
+		if json.Unmarshal([]byte(raw), &received) != nil || subtle.ConstantTimeCompare([]byte(received.Token), []byte(n.bridgeToken)) != 1 {
 			return 0
 		}
+		message := received.envelope
 		if message.Type == "drop" {
 			n.fileDrop(args)
 			return 0
@@ -1113,14 +1463,16 @@ func (n *nativeWindow) setup() error {
 		}
 		if message.Binary {
 			b := marshalReply(envelope{ID: message.ID, Type: "upload"})
-			com(n.webview, 32, uintptr(unsafe.Pointer(wide(string(b)))))
+			if hresult(com(n.webview, 32, uintptr(unsafe.Pointer(wide(string(b)))))) != nil {
+				calls.remove(message.ID)
+			}
 			return 0
 		}
 		go func() {
 			reply := calls.run(call, n.options.Bindings, nil, 0)
 			b := marshalReply(reply)
 			err := n.enqueue(func() {
-				if generation == n.generation {
+				if !n.closed && n.webview != nil && generation == n.generation {
 					if hresult(com(n.webview, 32, uintptr(unsafe.Pointer(wide(string(b)))))) != nil {
 						calls.remove(message.ID)
 					}
@@ -1134,20 +1486,27 @@ func (n *nativeWindow) setup() error {
 		}()
 		return 0
 	})
-	if err := hresult(com(n.webview, 34, msg, uintptr(unsafe.Pointer(&token)))); err != nil {
+	if err := register(34, 35, msg); err != nil {
 		return err
 	}
 	resource := n.callback("{AB00B74C-15F1-4646-80E8-E76341D25D71}", func(_ uintptr, args *comObject) uintptr {
+		if n.closed || n.webview == nil || args == nil {
+			return 0
+		}
 		n.resource(args)
 		return 0
 	})
-	if err := hresult(com(n.webview, 55, resource, uintptr(unsafe.Pointer(&token)))); err != nil {
+	if err := register(55, 56, resource); err != nil {
 		return err
 	}
 	if err := hresult(com(n.webview, 57, uintptr(unsafe.Pointer(wide("*"))), 0)); err != nil {
 		return err
 	}
+	navCompleted2IID := guid("{FDF8B738-EE1E-4DB2-A329-8D7D7B74D792}")
 	loaded := n.callback("{D33A35BF-1C49-4F98-93AB-006E0533FE1C}", func(_ uintptr, args *comObject) uintptr {
+		if n.closed || n.webview == nil || args == nil {
+			return 0
+		}
 		if n.ctx.Err() != nil {
 			n.fail(n.ctx.Err())
 			return 0
@@ -1156,12 +1515,35 @@ func (n *nativeWindow) setup() error {
 		com(args, 3, uintptr(unsafe.Pointer(&success)))
 		if success == 0 {
 			var status int32
-			if hresult(com(args, 4, uintptr(unsafe.Pointer(&status)))) == nil && (status == 14 || status == 9 && n.closeRequested) {
+			hasStatus := hresult(com(args, 4, uintptr(unsafe.Pointer(&status)))) == nil
+			if hasStatus && status == 9 && (n.closeRequested || n.quitting) {
 				return 0
 			}
-			n.fail(errors.New("navigation failed"))
-			return 0
+			if hasStatus && status == 14 {
+				if !n.contentCommitted {
+					if !n.initialLoaded && !n.closeRequested && !n.quitting {
+						n.fail(errors.New("navigation canceled"))
+					}
+					return 0
+				}
+			} else {
+				var httpStatus int32
+				var args2 *comObject
+				if hresult(com(args, 0, uintptr(unsafe.Pointer(&navCompleted2IID)), uintptr(unsafe.Pointer(&args2)))) == nil && args2 != nil {
+					_ = hresult(com(args2, 6, uintptr(unsafe.Pointer(&httpStatus))))
+					release(args2)
+				}
+				if httpStatus <= 0 {
+					n.contentCommitted = false
+					if !n.initialLoaded {
+						n.fail(errors.New("navigation failed"))
+					}
+					return 0
+				}
+			}
 		}
+		n.initialLoaded = true
+		n.contentCommitted = false
 		if !n.ready {
 			n.ready = true
 			for _, event := range n.pendingEvents {
@@ -1174,30 +1556,52 @@ func (n *nativeWindow) setup() error {
 		}
 		return 0
 	})
-	if err := hresult(com(n.webview, 15, loaded, uintptr(unsafe.Pointer(&token)))); err != nil {
+	if err := register(15, 16, loaded); err != nil {
 		return err
 	}
-	closed := n.callback("{5C19E9E0-092F-486B-AFFA-CA8231913039}", func(_ uintptr, args *comObject) uintptr {
-		if n.activeTrayMenu != nil {
-			n.activeTrayMenu.endMenu()
+	closed := n.callback("{5C19E9E0-092F-486B-AFFA-CA8231913039}", func(_ uintptr, _ *comObject) uintptr {
+		if n.closed {
+			return 0
 		}
-		user32.NewProc("PostQuitMessage").Call(0)
+		n.postQuit()
 		return 0
 	})
-	if err := hresult(com(n.webview, 59, closed, uintptr(unsafe.Pointer(&token)))); err != nil {
+	if err := register(59, 60, closed); err != nil {
 		return err
 	}
-	completedObj, completed := newCallback("{B99369F3-9B11-47B5-BC6F-8E7895FCEA17}", func(hr uintptr, _ *comObject) uintptr {
+	completedObj, completed := newScalarCallback("{B99369F3-9B11-47B5-BC6F-8E7895FCEA17}", func(hr, _ uintptr) uintptr {
+		if n.closed {
+			return 0
+		}
 		if err := hresult(hr); err != nil {
 			n.fail(err)
 			return 0
 		}
+		if n.ctx.Err() != nil {
+			n.fail(n.ctx.Err())
+			return 0
+		}
+		n.readyWG.Add(1)
 		go func() {
+			defer n.readyWG.Done()
+			n.onCloseReady.Store(true)
 			if n.options.OnReady != nil {
-				n.options.OnReady(&Window{native: n})
+				var panicErr error
+				func() {
+					defer func() {
+						if v := recover(); v != nil {
+							panicErr = fmt.Errorf("OnReady panic: %v", v)
+						}
+					}()
+					n.options.OnReady(&Window{native: n})
+				}()
+				if panicErr != nil {
+					_ = n.enqueue(func() { n.fail(panicErr) })
+					return
+				}
 			}
 			_ = n.enqueue(func() {
-				if n.closeRequested {
+				if n.closed || n.quitting || n.closing || n.closeRequested || n.webview == nil {
 					return
 				}
 				n.titleBarReady = true
@@ -1209,27 +1613,17 @@ func (n *nativeWindow) setup() error {
 		}()
 		return 0
 	})
-	defer callbackRelease(completedObj)
-	return hresult(com(n.webview, 27, uintptr(unsafe.Pointer(wide(bridgeScript))), completed))
-}
-
-// openURL 调用系统浏览器并返回ShellExecute失败信息
-// 入参: raw 外部地址
-// 返回: error 打开错误
-func openURL(raw string) error {
-	result, _, _ := shell32.NewProc("ShellExecuteW").Call(0, uintptr(unsafe.Pointer(wide("open"))), uintptr(unsafe.Pointer(wide(raw))), 0, 0, 1)
-	if result <= 32 {
-		return fmt.Errorf("open external URL failed (%d)", result)
-	}
-	return nil
+	defer releaseCallback(completedObj)
+	script := buildWindowsBridgeScript(n.bridgeToken, n.options.OnDrop != nil)
+	return hresult(com(n.webview, 27, uintptr(unsafe.Pointer(wide(script))), completed))
 }
 
 // external 异步打开外部地址并通知宿主错误
 // 入参: raw 外部地址
 func (n *nativeWindow) external(raw string) {
 	go func() {
-		if err := OpenURL(raw); err != nil && n.options.OnError != nil {
-			n.options.OnError(err)
+		if err := OpenURL(raw); err != nil {
+			n.reportError(err)
 		}
 	}()
 }
@@ -1247,14 +1641,13 @@ func (n *nativeWindow) requestClose() {
 		n.activeTrayMenu.endMenu()
 	}
 	if n.initializing {
+		n.initializing = false
 		n.cancel()
+		n.postQuit()
 		return
 	}
 	if n.ctx.Err() != nil || n.webview == nil {
-		if n.activeDialog != nil {
-			com(n.activeDialog, 23, 0x800704c7)
-		}
-		user32.NewProc("PostQuitMessage").Call(0)
+		n.postQuit()
 		return
 	}
 	if n.closing {
@@ -1270,8 +1663,9 @@ func (n *nativeWindow) requestClose() {
 		if n.options.OnClosing != nil {
 			func() {
 				defer func() {
-					if recover() != nil {
+					if v := recover(); v != nil {
 						allowed = false
+						n.reportError(fmt.Errorf("OnClosing panic: %v", v))
 					}
 				}()
 				allowed = n.options.OnClosing(n.ctx)
@@ -1279,6 +1673,9 @@ func (n *nativeWindow) requestClose() {
 		}
 		_ = n.enqueue(func() {
 			n.closing = false
+			if n.closed {
+				return
+			}
 			pending := n.closePending
 			n.closePending = false
 			if !allowed {
@@ -1287,18 +1684,25 @@ func (n *nativeWindow) requestClose() {
 				}
 				return
 			}
-			cb, callback := newCallback("{5C4889F0-5EF6-4C5A-952C-D8F1B92D0574}", func(hr uintptr, _ *comObject) uintptr {
+			if n.webview == nil {
+				n.postQuit()
+				return
+			}
+			cb, callback := newScalarCallback("{5C4889F0-5EF6-4C5A-952C-D8F1B92D0574}", func(hr, _ uintptr) uintptr {
+				if n.closed {
+					return 0
+				}
 				n.closeRequested = false
 				if err := hresult(hr); err != nil {
-					n.err = err
+					n.fail(err)
 				}
 				return 0
 			})
-			defer callbackRelease(cb)
+			defer releaseCallback(cb)
 			n.closeRequested = true
 			if err := hresult(com(n.webview, 36, uintptr(unsafe.Pointer(wide("Page.close"))), uintptr(unsafe.Pointer(wide("{}"))), callback)); err != nil {
 				n.closeRequested = false
-				n.err = err
+				n.fail(err)
 			}
 		})
 	}()

@@ -17,15 +17,19 @@ package guigo
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 // resourceRequest 保存异步资源请求及所属线程的请求流
@@ -58,27 +62,72 @@ type resourceWriter struct {
 	err    error
 }
 
+// normalizeHTTPStatus 规范化HTTP响应状态码
+// 入参: status 原始状态码
+// 返回: int 合法状态码
+func normalizeHTTPStatus(status int) int {
+	if status == 0 {
+		return 200
+	}
+	if status < 200 || status > 599 {
+		return 500
+	}
+	return status
+}
+
+// formatHeaders 序列化安全的HTTP响应头文本
+// 入参: headers 响应头集合
+// 返回: string HTTP响应头文本
+func formatHeaders(headers http.Header) string {
+	var header strings.Builder
+	for key, values := range headers {
+		for _, value := range values {
+			if !strings.ContainsAny(key+value, "\r\n\x00") {
+				fmt.Fprintf(&header, "%s: %s\r\n", key, value)
+			}
+		}
+	}
+	return header.String()
+}
+
 // Close 结束内存响应读取
 // 返回: error 关闭错误
 func (r *memoryResource) Close() error { return nil }
 
-// callResource 执行已登记的二进制调用并直接返回内存响应
+// callResource 校验凭据后执行已登记的二进制调用并直接返回内存响应
 // 入参: calls 页面调用队列, r 资源请求
 // 返回: *Resource 调用响应, error 请求错误
 func (n *nativeWindow) callResource(calls *callQueue, r *http.Request) (*Resource, error) {
+	if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Guigo-Token")), []byte(n.bridgeToken)) != 1 {
+		return &Resource{StatusCode: 403, Body: &memoryResource{bytes.NewReader(nil)}}, nil
+	}
 	if calls == nil || r.Method != http.MethodPost {
-		return nil, fmt.Errorf("invalid binary request")
+		return &Resource{StatusCode: 405, Body: &memoryResource{bytes.NewReader(nil)}}, nil
 	}
 	call := calls.take(r.URL.Query().Get("id"))
 	if call == nil {
-		return nil, fmt.Errorf("call is closed")
+		return &Resource{StatusCode: 410, Body: &memoryResource{bytes.NewReader(nil)}}, nil
+	}
+	if r.Body == nil {
+		calls.finish(call)
+		return &Resource{StatusCode: 400, Body: &memoryResource{bytes.NewReader(nil)}}, nil
+	}
+	size := r.ContentLength
+	if size < 0 {
+		if parsed, err := strconv.ParseInt(r.Header.Get("X-Guigo-Length"), 10, 64); err == nil {
+			size = parsed
+		}
+	}
+	if size < 4 || size > maxBinaryCallSize {
+		calls.finish(call)
+		return &Resource{StatusCode: 400, Body: &memoryResource{bytes.NewReader(nil)}}, nil
 	}
 	if body, ok := r.Body.(*requestBody); ok {
 		body.ctx = call.ctx
 	}
-	result := calls.run(call, n.options.Bindings, r.Body, r.ContentLength)
+	result := calls.run(call, n.options.Bindings, r.Body, size)
 	data := marshalReply(result)
-	return &Resource{Header: http.Header{"Content-Type": {"application/json"}, "Cache-Control": {"no-store"}}, Body: &memoryResource{bytes.NewReader(data)}}, nil
+	return &Resource{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}, "Cache-Control": {"no-store"}}, Body: &memoryResource{bytes.NewReader(data)}}, nil
 }
 
 // Read 按需读取请求内容并在块间归还窗口线程
@@ -151,10 +200,7 @@ func (w *resourceWriter) Header() http.Header {
 // 入参: status 响应状态码
 func (w *resourceWriter) WriteHeader(status int) {
 	if w.status == 0 {
-		if status < 200 || status > 599 {
-			status = 500
-		}
-		w.status = status
+		w.status = normalizeHTTPStatus(status)
 	}
 }
 
@@ -175,7 +221,7 @@ func (w *resourceWriter) Write(b []byte) (int, error) {
 	return n, err
 }
 
-// resource 拦截请求并将业务处理移交后台协程
+// resource 拦截请求并将业务处理移交后台Goroutine
 // 入参: args 资源请求参数
 func (n *nativeWindow) resource(args *comObject) {
 	var request *comObject
@@ -233,16 +279,20 @@ func (n *nativeWindow) resource(args *comObject) {
 	if hresult(com(request, 9, uintptr(unsafe.Pointer(&headers)))) == nil && headers != nil {
 		if hresult(com(headers, 8, uintptr(unsafe.Pointer(&iterator)))) == nil && iterator != nil {
 			var has int32
-			com(iterator, 4, uintptr(unsafe.Pointer(&has)))
-			for has != 0 {
-				var key, value *uint16
-				if hresult(com(iterator, 3, uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&value)))) != nil {
-					break
+			if hresult(com(iterator, 4, uintptr(unsafe.Pointer(&has)))) == nil {
+				for has != 0 {
+					var key, value *uint16
+					if hresult(com(iterator, 3, uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&value)))) != nil {
+						break
+					}
+					req.Header.Add(windows.UTF16PtrToString(key), windows.UTF16PtrToString(value))
+					ole32.NewProc("CoTaskMemFree").Call(uintptr(unsafe.Pointer(key)))
+					ole32.NewProc("CoTaskMemFree").Call(uintptr(unsafe.Pointer(value)))
+					has = 0
+					if hresult(com(iterator, 5, uintptr(unsafe.Pointer(&has)))) != nil {
+						break
+					}
 				}
-				req.Header.Add(utf16String(key), utf16String(value))
-				ole32.NewProc("CoTaskMemFree").Call(uintptr(unsafe.Pointer(key)))
-				ole32.NewProc("CoTaskMemFree").Call(uintptr(unsafe.Pointer(value)))
-				com(iterator, 5, uintptr(unsafe.Pointer(&has)))
 			}
 			release(iterator)
 		}
@@ -266,23 +316,41 @@ func (n *nativeWindow) resource(args *comObject) {
 		if body != nil {
 			defer body.Close()
 		}
-		if localURL(uri) && (n.options.ResourceHandler != nil || req.URL.Path == "/__guigo/call") {
+		if !localURL(uri) {
+			_ = n.enqueue(func() {
+				n.respond(args, nil, 403, "")
+				n.finishResource(args)
+			})
+			return
+		}
+		if isReservedPath(req.URL.Path) && req.URL.Path != "/__guigo/call" {
+			_ = n.enqueue(func() {
+				n.respond(args, nil, 404, "")
+				n.finishResource(args)
+			})
+			return
+		}
+		if n.options.ResourceHandler != nil || req.URL.Path == "/__guigo/call" {
 			var resource *Resource
+			var handlerErr error
 			func() {
 				defer func() {
-					if recover() != nil {
-						err = fmt.Errorf("resource handler panic")
+					if v := recover(); v != nil {
+						handlerErr = fmt.Errorf("resource handler panic: %v", v)
 					}
 				}()
 				if req.URL.Path == "/__guigo/call" {
-					resource, err = n.callResource(calls, req)
+					resource, handlerErr = n.callResource(calls, req)
 				} else {
-					resource, err = n.options.ResourceHandler(req)
+					resource, handlerErr = n.options.ResourceHandler(req)
 				}
 			}()
-			if err != nil {
+			if handlerErr != nil {
 				if resource != nil && resource.Body != nil {
 					resource.Body.Close()
+				}
+				if req.Context().Err() == nil {
+					n.reportError(handlerErr)
 				}
 				_ = n.enqueue(func() {
 					n.respond(args, nil, 500, "")
@@ -291,7 +359,19 @@ func (n *nativeWindow) resource(args *comObject) {
 				return
 			}
 			if resource != nil {
+				status := normalizeHTTPStatus(resource.StatusCode)
 				if resource.Body == nil {
+					if status == http.StatusNoContent || status == http.StatusNotModified {
+						headerText := formatHeaders(resource.Header.Clone())
+						_ = n.enqueue(func() {
+							n.respond(args, nil, status, headerText)
+							n.finishResource(args)
+						})
+						return
+					}
+					if req.Context().Err() == nil {
+						n.reportError(errors.New("missing resource body"))
+					}
 					_ = n.enqueue(func() {
 						n.respond(args, nil, 500, "")
 						n.finishResource(args)
@@ -301,16 +381,38 @@ func (n *nativeWindow) resource(args *comObject) {
 				size, e := resource.Body.Seek(0, io.SeekEnd)
 				if e != nil || size < 0 {
 					resource.Body.Close()
+					if req.Context().Err() == nil {
+						if e != nil {
+							n.reportError(e)
+						} else {
+							n.reportError(errors.New("invalid resource stream"))
+						}
+					}
 					_ = n.enqueue(func() {
 						n.respond(args, nil, 500, "")
 						n.finishResource(args)
 					})
 					return
 				}
+				cloned := resource.Header.Clone()
+				if cloned == nil {
+					cloned = make(http.Header)
+				}
+				if cloned.Get("Content-Length") == "" {
+					cloned.Set("Content-Length", strconv.FormatInt(size, 10))
+				}
+				if req.Method == http.MethodHead {
+					resource.Body.Close()
+					headerText := formatHeaders(cloned)
+					_ = n.enqueue(func() {
+						n.respond(args, nil, status, headerText)
+						n.finishResource(args)
+					})
+					return
+				}
 				direct := &responseSpool{file: resource.Body, size: size, complete: true, refs: 1}
-				direct.cond = sync.NewCond(&direct.mu)
 				defer direct.drop()
-				n.deliver(args, direct, resource.StatusCode, resource.Header.Clone())
+				n.deliver(args, direct, status, cloned)
 				return
 			}
 		}
@@ -329,18 +431,21 @@ func (n *nativeWindow) resource(args *comObject) {
 		w := &resourceWriter{header: make(http.Header), spool: spool}
 		func() {
 			defer func() {
-				if recover() != nil {
-					w.err = fmt.Errorf("resource handler panic")
+				if v := recover(); v != nil {
+					w.err = fmt.Errorf("resource handler panic: %v", v)
 				}
 			}()
-			if !localURL(uri) {
-				http.Error(w, "Forbidden", 403)
-			} else {
-				n.options.Handler.ServeHTTP(w, req)
+			if _, ok := n.options.Handler.(fileHandler); ok && strings.HasSuffix(req.URL.Path, "/index.html") {
+				req.URL.Path = strings.TrimSuffix(req.URL.Path, "index.html")
+				req.URL.RawPath = ""
 			}
+			n.options.Handler.ServeHTTP(w, req)
 		}()
 		if w.err != nil {
 			spool.finish(w.err)
+			if req.Context().Err() == nil {
+				n.reportError(w.err)
+			}
 			_ = n.enqueue(func() {
 				n.respond(args, nil, 500, "")
 				n.finishResource(args)
@@ -348,7 +453,15 @@ func (n *nativeWindow) resource(args *comObject) {
 			return
 		}
 		w.WriteHeader(200)
-		spool.finish(w.err)
+		spool.finish(nil)
+		if req.Method == http.MethodHead {
+			headerText := formatHeaders(w.header.Clone())
+			_ = n.enqueue(func() {
+				n.respond(args, nil, w.status, headerText)
+				n.finishResource(args)
+			})
+			return
+		}
 		n.deliver(args, spool, w.status, w.header.Clone())
 	}()
 }
@@ -367,24 +480,15 @@ func (n *nativeWindow) deliver(args *comObject, spool *responseSpool, status int
 		})
 		return
 	}
-	if status == 0 {
-		status = 200
-	}
+	status = normalizeHTTPStatus(status)
+	headerText := formatHeaders(headers)
 	if err := n.enqueueCleanup(func() {
 		defer release(stream)
 		if _, ok := n.resources[args]; !ok {
 			return
 		}
 		defer n.finishResource(args)
-		var header strings.Builder
-		for key, values := range headers {
-			for _, value := range values {
-				if !strings.ContainsAny(key+value, "\r\n\x00") {
-					fmt.Fprintf(&header, "%s: %s\r\n", key, value)
-				}
-			}
-		}
-		n.respond(args, stream, status, header.String())
+		n.respond(args, stream, status, headerText)
 	}, func() { release(stream) }); err != nil {
 		release(stream)
 	}
@@ -411,6 +515,7 @@ func (n *nativeWindow) setResponse(args, stream *comObject, status int, headers 
 	if n.environment == nil {
 		return
 	}
+	status = normalizeHTTPStatus(status)
 	var response *comObject
 	if err := hresult(com(n.environment, 4, uintptr(unsafe.Pointer(stream)), uintptr(status), uintptr(unsafe.Pointer(wide(http.StatusText(status)))), uintptr(unsafe.Pointer(wide(headers))), uintptr(unsafe.Pointer(&response)))); err != nil {
 		if n.ctx.Err() == nil {

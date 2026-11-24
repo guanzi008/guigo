@@ -15,8 +15,12 @@
 package guigo
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 )
@@ -24,8 +28,20 @@ import (
 // trayMessage 接收通知区域图标消息
 const trayMessage = 0x8031
 
-// taskbarCreated 接收任务栏重建与显示配置变化通知
-var taskbarCreated, _, _ = user32.NewProc("RegisterWindowMessageW").Call(uintptr(unsafe.Pointer(wide("TaskbarCreated"))))
+// 任务栏重建通知消息编号的惰性初始化状态
+var (
+	taskbarCreatedOnce sync.Once
+	taskbarCreatedID   uintptr
+)
+
+// taskbarCreatedMessage 惰性注册系统任务栏重建通知消息编号，避免纯命令行导入加载user32
+// 返回: uintptr 消息编号
+func taskbarCreatedMessage() uintptr {
+	taskbarCreatedOnce.Do(func() {
+		taskbarCreatedID, _, _ = user32.NewProc("RegisterWindowMessageW").Call(uintptr(unsafe.Pointer(wide("TaskbarCreated"))))
+	})
+	return taskbarCreatedID
+}
 
 // notifyIconData 对应Windows通知区域图标结构
 type notifyIconData struct {
@@ -43,24 +59,24 @@ type notifyIconData struct {
 	BalloonIcon         uintptr
 }
 
-// windowsTray 的配置与原生图标仅由STA线程访问，图标独立于窗口DPI资源
+// windowsTray 的配置与原生图标仅由STA线程访问，图标随窗口DPI变化同步刷新
 type windowsTray struct {
 	owner       *nativeWindow
 	handle      *Tray
 	options     TrayOptions
 	data        notifyIconData
 	revision    uint64
-	menuPending bool
+	menuPending atomic.Bool
 }
 
 // newTray 在STA线程创建独立托盘
-// 入参: options 托盘配置
+// 入参: ctx 调用上下文, options 托盘配置
 // 返回: *Tray 托盘句柄, error 创建错误
-func (n *nativeWindow) newTray(options TrayOptions) (*Tray, error) {
-	if taskbarCreated == 0 {
+func (n *nativeWindow) newTray(ctx context.Context, options TrayOptions) (*Tray, error) {
+	if taskbarCreatedMessage() == 0 {
 		return nil, errors.New("cannot register taskbar notification")
 	}
-	options, err := prepareTray(options, n.options.Title, n.iconData)
+	options, err := prepareTray(options, n.currentTitle(), n.iconData)
 	if err != nil {
 		return nil, err
 	}
@@ -72,6 +88,9 @@ func (n *nativeWindow) newTray(options TrayOptions) (*Tray, error) {
 		})
 	}}
 	err = n.invoke(func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if n.trays == nil {
 			n.trays = make(map[uint32]*windowsTray)
 		}
@@ -124,6 +143,29 @@ func (n *nativeWindow) trayIcon(data []byte) (uintptr, error) {
 	return icon, nil
 }
 
+// updateTrayIcons 在窗口DPI变化时按新缩放比例刷新所有活动托盘图标
+func (n *nativeWindow) updateTrayIcons() {
+	for _, t := range n.trays {
+		if len(t.options.Icon) == 0 {
+			continue
+		}
+		icon, err := n.trayIcon(t.options.Icon)
+		if err != nil {
+			n.reportError(err)
+			continue
+		}
+		old := t.data.Icon
+		t.data.Icon = icon
+		ok, _, _ := shell32.NewProc("Shell_NotifyIconW").Call(1, uintptr(unsafe.Pointer(&t.data)))
+		if ok == 0 {
+			t.data.Icon = old
+			user32.NewProc("DestroyIcon").Call(icon)
+			continue
+		}
+		user32.NewProc("DestroyIcon").Call(old)
+	}
+}
+
 // setTip 按系统缓冲区长度截断提示，保留完整UTF16字符
 // 入参: title 提示文字
 func (t *windowsTray) setTip(title string) {
@@ -153,14 +195,17 @@ func (t *windowsTray) register() bool {
 }
 
 // setOptions 在原生更新成功后替换配置，失败时保留旧图标与菜单
-// 入参: options 完整新配置
+// 入参: ctx 调用上下文, options 完整新配置
 // 返回: error 配置或系统错误
-func (t *windowsTray) setOptions(options TrayOptions) error {
-	options, err := prepareTray(options, t.owner.options.Title, t.owner.iconData)
+func (t *windowsTray) setOptions(ctx context.Context, options TrayOptions) error {
+	options, err := prepareTray(options, t.owner.currentTitle(), t.owner.iconData)
 	if err != nil {
 		return err
 	}
 	return t.owner.invoke(func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if t.owner.trays[t.data.ID] != t {
 			return ErrClosed
 		}
@@ -176,7 +221,7 @@ func (t *windowsTray) setOptions(options TrayOptions) error {
 			t.data = old
 			user32.NewProc("DestroyIcon").Call(icon)
 			t.handle.available.Store(false)
-			t.owner.activate()
+			_ = t.owner.activate()
 			return ErrTrayUnavailable
 		}
 		t.options = options
@@ -208,16 +253,30 @@ func (t *windowsTray) endMenu() {
 	}
 }
 
-// trayProc 处理任务栏恢复、激活及菜单选择，回调交给后台协程
+// runTrayCallback 在后台Goroutine执行托盘回调并隔离异常
+// 入参: fn 业务回调
+func (t *windowsTray) runTrayCallback(fn func()) {
+	n := t.owner
+	go func() {
+		defer func() {
+			if v := recover(); v != nil {
+				n.reportError(fmt.Errorf("tray callback panic: %v", v))
+			}
+		}()
+		fn()
+	}()
+}
+
+// trayProc 处理任务栏恢复、激活及菜单选择，回调交给后台Goroutine
 // 入参: msg 窗口消息, wparam 坐标参数, lparam 通知数据
 // 返回: bool 是否已处理
 func (n *nativeWindow) trayProc(msg, wparam, lparam uintptr) bool {
-	if msg == taskbarCreated {
+	if len(n.trays) > 0 && msg == taskbarCreatedMessage() {
 		for _, t := range n.trays {
 			available := t.register()
 			t.handle.available.Store(available)
 			if !available {
-				n.activate()
+				_ = n.activate()
 			}
 		}
 		return true
@@ -233,12 +292,12 @@ func (n *nativeWindow) trayProc(msg, wparam, lparam uintptr) bool {
 	case 0x400, 0x401:
 		if t.options.MenuOnActivate {
 			t.queueMenu(wparam)
-		} else if t.options.OnActivate != nil {
-			go t.options.OnActivate()
+		} else if fn := t.options.OnActivate; fn != nil {
+			t.runTrayCallback(fn)
 		}
 	case 0x208:
-		if t.options.OnSecondaryActivate != nil {
-			go t.options.OnSecondaryActivate()
+		if fn := t.options.OnSecondaryActivate; fn != nil {
+			t.runTrayCallback(fn)
 		}
 	case 0x7b:
 		t.queueMenu(wparam)
@@ -246,20 +305,19 @@ func (n *nativeWindow) trayProc(msg, wparam, lparam uintptr) bool {
 	return true
 }
 
-// queueMenu 将菜单显示排到最外层消息循环，合并尚未执行的打开请求
+// queueMenu 将菜单显示排到最外层消息循环，合并尚未执行的打开请求并确保释放标志
 // 入参: position 通知消息携带的屏幕坐标
 func (t *windowsTray) queueMenu(position uintptr) {
 	n := t.owner
-	if t.menuPending || n.activeTrayMenu != nil {
+	if n.activeTrayMenu != nil || !t.menuPending.CompareAndSwap(false, true) {
 		return
 	}
-	t.menuPending = true
 	go func() {
-		if err := n.invokeTop(func() error {
-			t.menuPending = false
+		defer t.menuPending.Store(false)
+		if err := n.invokeTop(nil, func() error {
 			return t.showMenu(position)
-		}); err != nil && !errors.Is(err, ErrClosed) && n.options.OnError != nil {
-			n.options.OnError(err)
+		}); err != nil && !errors.Is(err, ErrClosed) {
+			n.reportError(err)
 		}
 	}()
 }

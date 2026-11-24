@@ -4,6 +4,8 @@ int guigo3CanClose(void) { return 1; }
 void guigo3Ready(void) {}
 void guigo3TitleChanged(int active, int maximized) {}
 void guigo3DialogFinished(unsigned long long id, int status, char **paths, int count) {}
+int guigo3AllowNavigation(const char *uri, int new_window, int user_gesture) { return 1; }
+void guigo3NavigationStarted(void) {}
 
 static gboolean accepts(GtkFileFilter *filter, const char *name) {
     GtkFileFilterInfo info = {0};

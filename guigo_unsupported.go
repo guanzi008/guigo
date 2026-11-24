@@ -21,11 +21,31 @@ import "context"
 // nativeWindow 提供未适配平台的宿主占位类型
 type nativeWindow struct{}
 
-// SupportsWindowMaterial 查询当前平台是否提供指定窗口材质
+// supportsWindowMaterial 查询当前平台是否提供指定窗口材质
 // 入参: material 窗口材质
 // 返回: bool 未适配平台返回false
-func SupportsWindowMaterial(material WindowMaterial) bool {
+func supportsWindowMaterial(material WindowMaterial) bool {
 	return false
+}
+
+// systemDark 返回未适配平台的默认浅色外观
+// 返回: bool 未适配平台返回false
+func systemDark() bool {
+	return false
+}
+
+// openURL 返回平台不支持错误
+// 入参: raw 外部地址
+// 返回: error 平台错误
+func openURL(raw string) error {
+	return ErrUnsupportedPlatform
+}
+
+// run 返回平台不支持错误
+// 入参: parent 运行上下文, o 宿主选项
+// 返回: error 平台错误
+func run(parent context.Context, o Options) error {
+	return ErrUnsupportedPlatform
 }
 
 // activate 返回未适配平台错误
@@ -68,10 +88,10 @@ func (n *nativeWindow) printCapabilities(ctx context.Context) (PrintCapabilities
 	return PrintCapabilities{}, ErrUnsupportedPlatform
 }
 
-// showPrintUI 返回未适配平台的打印错误
+// showPrintDialog 返回未适配平台的打印错误
 // 入参: ctx 调用上下文, kind 打印窗口类型
 // 返回: error 平台错误
-func (n *nativeWindow) showPrintUI(ctx context.Context, kind string) error {
+func (n *nativeWindow) showPrintDialog(ctx context.Context, kind PrintDialogKind) error {
 	return ErrUnsupportedPlatform
 }
 
@@ -80,27 +100,6 @@ func (n *nativeWindow) showPrintUI(ctx context.Context, kind string) error {
 // 返回: PrintResult 空提交结果, error 平台错误
 func (n *nativeWindow) print(ctx context.Context, o PrintOptions) (PrintResult, error) {
 	return PrintResult{}, ErrUnsupportedPlatform
-}
-
-// resourceURL 返回未适配平台的空资源地址
-// 入参: path 资源路径
-// 返回: string 空地址
-func resourceURL(path string) string {
-	return ""
-}
-
-// openURL 返回平台不支持错误
-// 入参: raw 外部地址
-// 返回: error 平台错误
-func openURL(raw string) error {
-	return ErrUnsupportedPlatform
-}
-
-// run 返回平台不支持错误
-// 入参: parent 运行上下文, o 宿主选项
-// 返回: error 平台错误
-func run(parent context.Context, o Options) error {
-	return ErrUnsupportedPlatform
 }
 
 // emit 返回平台不支持错误
@@ -144,16 +143,16 @@ func (n *nativeWindow) setSize(w, h int) error {
 }
 
 // dialog 返回平台不支持错误
-// 入参: o 对话框选项, mode 对话框类型
+// 入参: ctx 调用上下文, o 对话框选项, mode 对话框类型
 // 返回: string 空路径, error 平台错误
-func (n *nativeWindow) dialog(o DialogOptions, mode int) (string, error) {
+func (n *nativeWindow) dialog(ctx context.Context, o DialogOptions, mode int) (string, error) {
 	return "", ErrUnsupportedPlatform
 }
 
 // dialogs 返回平台不支持错误
-// 入参: o 对话框选项, mode 对话框类型
+// 入参: ctx 调用上下文, o 对话框选项, mode 对话框类型
 // 返回: []string 空路径列表, error 平台错误
-func (n *nativeWindow) dialogs(o DialogOptions, mode int) ([]string, error) {
+func (n *nativeWindow) dialogs(ctx context.Context, o DialogOptions, mode int) ([]string, error) {
 	return nil, ErrUnsupportedPlatform
 }
 
@@ -169,4 +168,11 @@ func (n *nativeWindow) setTitleBarColors(colors TitleBarColors) error {
 // 返回: error 平台错误
 func (n *nativeWindow) setWindowMaterial(material WindowMaterial) error {
 	return ErrUnsupportedPlatform
+}
+
+// newTray 返回未适配平台错误
+// 入参: ctx 调用上下文, options 托盘配置
+// 返回: *Tray 空句柄, error 平台错误
+func (n *nativeWindow) newTray(ctx context.Context, options TrayOptions) (*Tray, error) {
+	return nil, ErrUnsupportedPlatform
 }

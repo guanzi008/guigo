@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build (windows && amd64) || (linux && !android && (amd64 || arm64) && !guigo_gtk3)
-
 package guigo
 
-// bridgeScript 在文档创建时安装Promise调用桥与事件订阅
-const bridgeScript = `(() => {
-	if (location.origin !== "` + resourceOrigin + `" || window !== window.top) return;
+import "encoding/json"
+
+// bridgeScriptCore 为双平台共用的Promise调用桥与事件订阅主体，依赖外层提供transport、bridgeToken与dropEnabled
+const bridgeScriptCore = `(() => {
 	let serial = 0;
 	let closed = false;
 	const pending = new Map();
@@ -83,10 +82,12 @@ const bridgeScript = `(() => {
 		if (header.length > 4 * 1024 * 1024) throw new RangeError("binary header too large");
 		const prefix = new Uint8Array(4);
 		new DataView(prefix.buffer).setUint32(0, header.length, true);
-		return {parts:[prefix, header, ...bodies], size:4 + header.length + parts.reduce((total, part) => total + part.size, 0)};
+		const size = 4 + header.length + parts.reduce((total, part) => total + part.size, 0);
+		if (size > 128 * 1024 * 1024) throw new RangeError("binary payload too large");
+		return {parts:[prefix, header, ...bodies], size};
 	};
 	const cancel = id => {
-		try { chrome.webview.postMessage({type:"cancel", id}); }
+		try { transport.postMessage({type:"cancel", id}); }
 		catch {}
 	};
 	const settle = message => {
@@ -95,7 +96,7 @@ const bridgeScript = `(() => {
 		pending.delete(message.id);
 		call.cleanup();
 		try {
-			chrome.webview.postMessage({type:message.error ? "cancel" : "accept", id:message.id});
+			transport.postMessage({type:message.error ? "cancel" : "accept", id:message.id});
 		} catch (error) {
 			cancel(message.id);
 			call.reject(error);
@@ -108,7 +109,7 @@ const bridgeScript = `(() => {
 			call.reject(error);
 		} else call.resolve(message.value);
 	};
-	chrome.webview.addEventListener("message", event => {
+	transport.addEventListener("message", event => {
 		const message = event.data;
 		if (!message || typeof message !== "object") return;
 		if (message.type === "reply") settle(message);
@@ -128,7 +129,7 @@ const bridgeScript = `(() => {
 			async call(name, args = null, options = {}) {
 				if (closed) throw new Error("document closed");
 				if (typeof name !== "string" || !name) throw new TypeError("method must be a non-empty string");
-				const signal = options.signal;
+				const signal = options?.signal;
 				signal?.throwIfAborted();
 				if (pending.size + uploads.length >= 128) throw new Error("too many pending calls");
 				const data = packet(args);
@@ -149,7 +150,7 @@ const bridgeScript = `(() => {
 						const cleanup = () => signal?.removeEventListener("abort", abort);
 						const upload = async () => {
 							try {
-								const response = await fetch("/__guigo/call?id=" + id, {method:"POST", body, signal, headers:{"X-Guigo-Length":String(data.size)}});
+								const response = await fetch("/__guigo/call?id=" + id, {method:"POST", body:transport.body ? await transport.body(body) : body, signal, headers:{"X-Guigo-Length":String(data.size), "X-Guigo-Token":bridgeToken}});
 								if (!response.ok) throw new Error("binary call failed");
 								settle(await response.json());
 							} catch (error) {
@@ -163,7 +164,7 @@ const bridgeScript = `(() => {
 						signal?.addEventListener("abort", abort, {once:true});
 						if (signal?.aborted) { abort(); return; }
 						try {
-							chrome.webview.postMessage({type:"call", id, name, args:data.args, binary:!!body});
+							transport.postMessage({type:"call", id, name, args:data.args, binary:!!body});
 						} catch (error) {
 							pending.delete(id);
 							cleanup();
@@ -193,28 +194,24 @@ const bridgeScript = `(() => {
 		pending.clear();
 		for (const call of uploads.splice(0)) { call.cleanup(); call.reject(new Error("document closed")); }
 	});
-	addEventListener("dragover", event => {
-		if (event.dataTransfer && Array.from(event.dataTransfer.types).includes("Files")) event.preventDefault();
-	});
-	addEventListener("drop", event => {
-		const files = Array.from(event.dataTransfer?.files || []);
-		if (files.length && chrome.webview.postMessageWithAdditionalObjects) {
-			event.preventDefault();
-			chrome.webview.postMessageWithAdditionalObjects({type:"drop"}, files);
-		}
-	});
+	if (dropEnabled && transport.postMessageWithAdditionalObjects) {
+		addEventListener("dragover", event => {
+			if (event.dataTransfer && Array.from(event.dataTransfer.types).includes("Files")) event.preventDefault();
+		});
+		addEventListener("drop", event => {
+			const files = Array.from(event.dataTransfer?.files || []);
+			if (files.length) {
+				event.preventDefault();
+				transport.postMessageWithAdditionalObjects({type:"drop"}, files);
+			}
+		});
+	}
 })();`
 
-// localURL 判断请求是否属于WebView2宿主来源
-// 入参: raw 资源地址
-// 返回: bool 是否属于宿主来源
-func localURL(raw string) bool {
-	return localResource(resourceOrigin, raw)
-}
-
-// resourceURL 构造WebView2宿主资源地址
-// 入参: path 资源路径
-// 返回: string 宿主资源地址
-func resourceURL(path string) string {
-	return resourceAddress(resourceOrigin, path)
+// bridgeScriptQuoted 编码桥接凭据为JavaScript字符串字面量
+// 入参: token 凭据文本
+// 返回: string JSON字符串字面量
+func bridgeScriptQuoted(token string) string {
+	data, _ := json.Marshal(token)
+	return string(data)
 }

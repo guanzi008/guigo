@@ -17,6 +17,7 @@
 package guigo
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math"
@@ -26,6 +27,13 @@ import (
 	"unsafe"
 
 	"github.com/ebitengine/purego"
+)
+
+// 按需加载的CUPS查询接口及初始化状态
+var (
+	cups      cupsAPI
+	cupsOnce  sync.Once
+	cupsError error
 )
 
 // cupsDestination 对应CUPS队列及当前用户保存的选项
@@ -60,22 +68,13 @@ type cupsAPI struct {
 	MediaSize     func(uintptr, *cupsDestination, uintptr, int32, int32, uint32, *cupsMedia) int32 `symbol:"cupsGetDestMediaBySize"`
 }
 
-// cups 保存按需加载的CUPS查询接口
-var cups cupsAPI
-
-// cupsOnce 保证CUPS查询接口只加载一次
-var cupsOnce sync.Once
-
-// cupsError 保存CUPS接口加载错误
-var cupsError error
-
 // loadCUPS 将可选设备查询与WebKitGTK基本打印能力分开，缺少CUPS时返回明确错误
 // 返回: error 设备查询库加载错误
 func loadCUPS() error {
 	cupsOnce.Do(func() {
 		handle, err := purego.Dlopen("libcups.so.2", purego.RTLD_NOW|purego.RTLD_LOCAL)
 		if err != nil {
-			cupsError = fmt.Errorf("%w: %v", ErrPrintUnsupported, err)
+			cupsError = fmt.Errorf("%w: %w", ErrPrintUnsupported, err)
 			return
 		}
 		var api cupsAPI
@@ -83,7 +82,7 @@ func loadCUPS() error {
 		for i := 0; i < value.NumField(); i++ {
 			address, err := purego.Dlsym(handle, value.Type().Field(i).Tag.Get("symbol"))
 			if err != nil {
-				cupsError = fmt.Errorf("%w: %v", ErrPrintUnsupported, err)
+				cupsError = fmt.Errorf("%w: %w", ErrPrintUnsupported, err)
 				purego.Dlclose(handle)
 				return
 			}
@@ -92,54 +91,6 @@ func loadCUPS() error {
 		cups = api
 	})
 	return cupsError
-}
-
-// listPrinters 读取CUPS队列，按队列名称排除保存的重复实例
-// 入参: ctx 查询上下文
-// 返回: []PrinterInfo 系统打印队列, error 查询或取消错误
-func (n *nativeWindow) listPrinters(ctx context.Context) ([]PrinterInfo, error) {
-	n.mu.Lock()
-	closed := n.closed
-	n.mu.Unlock()
-	if closed {
-		return nil, ErrClosed
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if err := loadCUPS(); err != nil {
-		return nil, err
-	}
-	var destinations *cupsDestination
-	count := cups.Dests(0, &destinations)
-	defer cups.FreeDests(count, destinations)
-	if count < 0 || count > 65536 || count > 0 && destinations == nil {
-		return nil, fmt.Errorf("invalid CUPS destinations")
-	}
-	result := []PrinterInfo{}
-	for _, item := range unsafe.Slice(destinations, count) {
-		if item.Instance != nil {
-			continue
-		}
-		result = append(result, PrinterInfo{Name: nativeString(item.Name), Default: item.Default != 0})
-	}
-	return result, ctx.Err()
-}
-
-// queryPrinter 查询IPP纸张及边距，拒绝CUPS返回的近似尺寸
-// 入参: ctx 查询上下文, o 待核对设备设置
-// 返回: PrinterProfile 设备能力及当前纸面, error 配置、查询或取消错误
-func (n *nativeWindow) queryPrinter(ctx context.Context, o PrintOptions) (PrinterProfile, error) {
-	n.mu.Lock()
-	closed := n.closed
-	n.mu.Unlock()
-	if closed {
-		return PrinterProfile{}, ErrClosed
-	}
-	if err := loadCUPS(); err != nil {
-		return PrinterProfile{}, err
-	}
-	return queryCUPSPrinter(ctx, o, cups)
 }
 
 // queryCUPSPrinter 将独立CUPS能力快照转换为跨平台设备数据
@@ -151,20 +102,42 @@ func queryCUPSPrinter(ctx context.Context, o PrintOptions, cups cupsAPI) (Printe
 	}
 	var destinations *cupsDestination
 	count := cups.Dests(0, &destinations)
-	defer cups.FreeDests(count, destinations)
+	if count > 0 && destinations != nil {
+		defer cups.FreeDests(count, destinations)
+	}
 	if count < 0 || count > 65536 || count > 0 && destinations == nil {
 		return PrinterProfile{}, fmt.Errorf("invalid CUPS destinations")
 	}
-	var selected *cupsDestination
+	var selected, fallback *cupsDestination
+	defaultName := ""
 	for i := range int(count) {
 		item := (*cupsDestination)(unsafe.Add(unsafe.Pointer(destinations), uintptr(i)*unsafe.Sizeof(cupsDestination{})))
-		if item.Instance == nil && (o.Printer != "" && nativeString(item.Name) == o.Printer || o.Printer == "" && item.Default != 0) {
-			selected = item
-			break
+		name := nativeString(item.Name)
+		if item.Default != 0 && (defaultName == "" || item.Instance == nil) {
+			defaultName = name
+		}
+		if o.Printer != "" {
+			if item.Instance == nil && name == o.Printer {
+				selected = item
+			} else if fallback == nil && name == o.Printer {
+				fallback = item
+			}
+		} else if item.Default != 0 {
+			if item.Instance == nil {
+				selected = item
+			} else if fallback == nil {
+				fallback = item
+			}
 		}
 	}
 	if selected == nil {
-		return PrinterProfile{}, fmt.Errorf("printer not found")
+		selected = fallback
+	}
+	if selected == nil {
+		if o.Printer == "" {
+			return PrinterProfile{}, fmt.Errorf("%w: no default printer", ErrPrinterNotFound)
+		}
+		return PrinterProfile{}, fmt.Errorf("%w: %s", ErrPrinterNotFound, o.Printer)
 	}
 	info := cups.Info(0, selected)
 	if info == 0 {
@@ -178,7 +151,8 @@ func queryCUPSPrinter(ctx context.Context, o PrintOptions, cups cupsAPI) (Printe
 		}
 		return nativeString(cups.String(cups.FindDefault(0, selected, info, key), 0, 0))
 	}
-	p := PrinterProfile{Printer: PrinterInfo{Name: nativeString(selected.Name), Default: selected.Default != 0}, Papers: []PrintPaper{}, Color: cups.Supported(0, selected, info, "print-color-mode", "color") != 0, Duplex: cups.Supported(0, selected, info, "sides", "two-sided-long-edge") != 0 || cups.Supported(0, selected, info, "sides", "two-sided-short-edge") != 0, MaxCopies: 1}
+	selectedName := nativeString(selected.Name)
+	p := PrinterProfile{Printer: PrinterInfo{Name: selectedName, Default: selected.Default != 0 || selectedName == defaultName}, Papers: []PrintPaper{}, Color: cups.Supported(0, selected, info, "print-color-mode", "color") != 0, Duplex: cups.Supported(0, selected, info, "sides", "two-sided-long-edge") != 0 || cups.Supported(0, selected, info, "sides", "two-sided-short-edge") != 0, MaxCopies: 1}
 	if attr := cups.FindSupported(0, selected, info, "copies"); attr != 0 {
 		var upper int32
 		cups.Range(attr, 0, &upper)
@@ -194,7 +168,11 @@ func queryCUPSPrinter(ctx context.Context, o PrintOptions, cups cupsAPI) (Printe
 		}
 		var media cupsMedia
 		if cups.MediaIndex(0, selected, info, i, 0, &media) != 0 && media.Width > 0 && media.Height > 0 {
-			name := nativeString(&media.Name[0])
+			nameBytes := media.Name[:]
+			if zero := bytes.IndexByte(nameBytes, 0); zero >= 0 {
+				nameBytes = nameBytes[:zero]
+			}
+			name := string(nameBytes)
 			p.Papers = append(p.Papers, PrintPaper{ID: name, Name: name, Width: float64(media.Width) / 100, Height: float64(media.Height) / 100})
 		}
 	}
@@ -207,13 +185,13 @@ func queryCUPSPrinter(ctx context.Context, o PrintOptions, cups cupsAPI) (Printe
 	}
 	flags := uint32(4)
 	if o.Duplex == "" {
-		o.Duplex = map[string]string{"two-sided-long-edge": "longEdge", "two-sided-short-edge": "shortEdge"}[defaultString("sides")]
+		o.Duplex = map[string]PrintDuplex{"two-sided-long-edge": PrintDuplexLongEdge, "two-sided-short-edge": PrintDuplexShortEdge}[defaultString("sides")]
 		if o.Duplex == "" {
-			o.Duplex = "simplex"
+			o.Duplex = PrintDuplexSimplex
 		}
 	}
-	if o.Duplex != "simplex" {
-		if cups.Supported(0, selected, info, "sides", map[string]string{"longEdge": "two-sided-long-edge", "shortEdge": "two-sided-short-edge"}[o.Duplex]) == 0 {
+	if o.Duplex != PrintDuplexSimplex {
+		if cups.Supported(0, selected, info, "sides", map[PrintDuplex]string{PrintDuplexLongEdge: "two-sided-long-edge", PrintDuplexShortEdge: "two-sided-short-edge"}[o.Duplex]) == 0 {
 			return p, fmt.Errorf("%w: duplex mode", ErrPrintUnsupported)
 		}
 		flags |= 2
@@ -222,10 +200,15 @@ func queryCUPSPrinter(ctx context.Context, o PrintOptions, cups cupsAPI) (Printe
 		return p, fmt.Errorf("%w: paper size", ErrPrintUnsupported)
 	}
 	if o.Orientation == "" {
-		o.Orientation = "portrait"
+		o.Orientation = PrintOrientationPortrait
 		orientation := option("orientation-requested")
-		if orientation == "4" || orientation == "" && cups.Integer(cups.FindDefault(0, selected, info, "orientation-requested"), 0) == 4 {
-			o.Orientation = "landscape"
+		if orientation == "4" || orientation == "5" {
+			o.Orientation = PrintOrientationLandscape
+		} else if orientation == "" {
+			defaultOrientation := cups.Integer(cups.FindDefault(0, selected, info, "orientation-requested"), 0)
+			if defaultOrientation == 4 || defaultOrientation == 5 {
+				o.Orientation = PrintOrientationLandscape
+			}
 		}
 	}
 	if o.Copies == 0 {
@@ -238,29 +221,132 @@ func queryCUPSPrinter(ctx context.Context, o PrintOptions, cups cupsAPI) (Printe
 		}
 	}
 	if o.Color == "" {
-		o.Color = "grayscale"
+		o.Color = PrintColorModeGrayscale
 		if p.Color && defaultString("print-color-mode") != "monochrome" {
-			o.Color = "color"
+			o.Color = PrintColorModeColor
 		}
 	}
 	if o.Collation == "" {
-		o.Collation = "collated"
+		o.Collation = PrintCollationCollated
 	}
 	o.Printer = p.Printer.Name
 	p.Options = o
 	p.Width, p.Height = o.Width, o.Height
 	left, top, right, bottom := float64(media.Left)/100, float64(media.Top)/100, float64(media.Right)/100, float64(media.Bottom)/100
-	if o.Orientation == "landscape" {
+	if o.Orientation == PrintOrientationLandscape {
 		p.Width, p.Height = p.Height, p.Width
 		left, top, right, bottom = top, right, bottom, left
 	}
-	p.PrintableArea = PrintRectangle{X: left, Y: top, Width: p.Width - left - right, Height: p.Height - top - bottom}
+	p.PrintableArea = Rect{X: left, Y: top, Width: p.Width - left - right, Height: p.Height - top - bottom}
 	return p, ctx.Err()
+}
+
+// listCUPSPrinters 读取CUPS队列，按队列名称排除保存的重复实例
+// 返回: []PrinterInfo 系统打印队列, error 查询错误
+func listCUPSPrinters() ([]PrinterInfo, error) {
+	if err := loadCUPS(); err != nil {
+		return nil, err
+	}
+	var destinations *cupsDestination
+	count := cups.Dests(0, &destinations)
+	if count > 0 && destinations != nil {
+		defer cups.FreeDests(count, destinations)
+	}
+	if count < 0 || count > 65536 || count > 0 && destinations == nil {
+		return nil, fmt.Errorf("invalid CUPS destinations")
+	}
+	result := []PrinterInfo{}
+	if count > 0 {
+		items := unsafe.Slice(destinations, count)
+		defaultName := ""
+		for _, item := range items {
+			if item.Default != 0 && (defaultName == "" || item.Instance == nil) {
+				defaultName = nativeString(item.Name)
+			}
+		}
+		seen := make(map[string]bool, len(items))
+		for _, item := range items {
+			if item.Instance != nil {
+				continue
+			}
+			name := nativeString(item.Name)
+			seen[name] = true
+			result = append(result, PrinterInfo{Name: name, Default: item.Default != 0 || name == defaultName})
+		}
+		if defaultName != "" && !seen[defaultName] {
+			result = append(result, PrinterInfo{Name: defaultName, Default: true})
+		}
+	}
+	return result, nil
+}
+
+// listPrinters 在后台执行CUPS队列读取并及时响应上下文取消和窗口关闭
+// 入参: ctx 查询上下文
+// 返回: []PrinterInfo 系统打印队列, error 查询或取消错误
+func (n *nativeWindow) listPrinters(ctx context.Context) ([]PrinterInfo, error) {
+	if n.isClosed() {
+		return nil, ErrClosed
+	}
+	type response struct {
+		printers []PrinterInfo
+		err      error
+	}
+	done := make(chan response, 1)
+	go func() {
+		printers, err := listCUPSPrinters()
+		done <- response{printers: printers, err: err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			return nil, r.err
+		}
+		return r.printers, ctx.Err()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-n.done:
+		return nil, ErrClosed
+	}
+}
+
+// queryPrinter 在后台查询IPP纸张及边距，及时响应上下文取消和窗口关闭
+// 入参: ctx 查询上下文, o 待核对设备设置
+// 返回: PrinterProfile 设备能力及当前纸面, error 配置、查询或取消错误
+func (n *nativeWindow) queryPrinter(ctx context.Context, o PrintOptions) (PrinterProfile, error) {
+	if n.isClosed() {
+		return PrinterProfile{}, ErrClosed
+	}
+	if err := loadCUPS(); err != nil {
+		return PrinterProfile{}, err
+	}
+	type response struct {
+		profile PrinterProfile
+		err     error
+	}
+	done := make(chan response, 1)
+	go func() {
+		profile, err := queryCUPSPrinter(ctx, o, cups)
+		done <- response{profile: profile, err: err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			return PrinterProfile{}, r.err
+		}
+		return r.profile, ctx.Err()
+	case <-ctx.Done():
+		return PrinterProfile{}, ctx.Err()
+	case <-n.done:
+		return PrinterProfile{}, ErrClosed
+	}
 }
 
 // showPrinterProperties 保留不支持平台属性窗口的明确能力边界
 // 入参: ctx 调用上下文, name 系统队列名称
-// 返回: error 平台不支持错误
+// 返回: error 关闭或平台不支持错误
 func (n *nativeWindow) showPrinterProperties(ctx context.Context, name string) error {
+	if n.isClosed() {
+		return ErrClosed
+	}
 	return ErrPrintUnsupported
 }
