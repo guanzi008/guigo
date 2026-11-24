@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !android && (amd64 || arm64 || (loong64 && cgo))
+//go:build !android && (amd64 || arm64) && (!guigo_gtk3 || cgo)
 
 package guigo
 
@@ -21,7 +21,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -55,23 +54,6 @@ type linuxThemeAPI struct {
 	Variant      func(uintptr) uintptr                                                                                         `symbol:"g_variant_get_variant"`
 	TypeString   func(uintptr) *byte                                                                                           `symbol:"g_variant_get_type_string"`
 	Uint32       func(uintptr) uint32                                                                                          `symbol:"g_variant_get_uint32"`
-}
-
-// systemDark 检测Linux桌面环境是否偏好深色外观
-// 返回: bool 是否偏好深色外观
-func systemDark() bool {
-	if theme := strings.ToLower(strings.TrimSpace(os.Getenv("GTK_THEME"))); theme != "" {
-		if strings.Contains(theme, ":light") {
-			return false
-		}
-		if strings.Contains(theme, "dark") {
-			return true
-		}
-	}
-	if dark, ok := linuxPortalDark(); ok {
-		return dark
-	}
-	return linuxGTKSettingsDark()
 }
 
 // loadLinuxTheme 按需加载GIO与GLib符号供系统外观查询使用
@@ -219,67 +201,6 @@ func linuxPortalDark() (bool, bool) {
 		return false, true
 	}
 	return false, false
-}
-
-// linuxGTKSettingsDark 读取用户GTK配置文件回退判断深色偏好
-// 返回: bool 是否偏好深色外观
-func linuxGTKSettingsDark() bool {
-	configDir := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME"))
-	if configDir == "" {
-		dir, err := os.UserConfigDir()
-		if err != nil {
-			return false
-		}
-		configDir = dir
-	}
-	for _, sub := range []string{"gtk-4.0", "gtk-3.0"} {
-		data, err := os.ReadFile(filepath.Join(configDir, sub, "settings.ini"))
-		if err != nil {
-			continue
-		}
-		inSettings := false
-		hasPreferDark := false
-		preferDark := false
-		hasTheme := false
-		themeDark := false
-		for _, line := range strings.Split(string(data), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
-				continue
-			}
-			if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-				inSettings = strings.EqualFold(strings.TrimSpace(line[1:len(line)-1]), "settings")
-				continue
-			}
-			if !inSettings {
-				continue
-			}
-			key, val, ok := strings.Cut(line, "=")
-			if !ok {
-				continue
-			}
-			key = strings.ToLower(strings.TrimSpace(key))
-			val = strings.ToLower(strings.TrimSpace(val))
-			if key == "gtk-application-prefer-dark-theme" {
-				hasPreferDark = true
-				preferDark = val == "1" || val == "true"
-			} else if key == "gtk-theme-name" && val != "" {
-				hasTheme = true
-				if strings.Contains(val, ":light") {
-					themeDark = false
-				} else {
-					themeDark = strings.Contains(val, "dark")
-				}
-			}
-		}
-		if hasPreferDark {
-			return preferDark
-		}
-		if hasTheme {
-			return themeDark
-		}
-	}
-	return false
 }
 
 // linuxError 对应GLib错误结构的原生布局
