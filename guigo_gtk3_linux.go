@@ -38,12 +38,12 @@ func guigo3Script(origin, token string) string {
 	const reportError = error => console.error(error);
 	const events = new EventSource("/__guigo/events?token=" + encodeURIComponent(bridgeToken));
 	const connected = new Promise(resolve => events.addEventListener("open", resolve, {once:true}));
-	const listeners = new EventTarget();
-	const receive = data => listeners.dispatchEvent(new MessageEvent("message", {data}));
+	let onMessage = () => {};
+	const receive = data => onMessage({data});
 	events.onmessage = event => receive(JSON.parse(event.data));
 	const requests = new Map();
 	const transport = {
-		addEventListener: (...args) => listeners.addEventListener(...args),
+		addEventListener: (name, listener) => { if (name === "message") onMessage = listener; },
 		postMessage(message) {
 			if (message.type === "cancel") requests.get(message.id)?.abort();
 			const controller = message.type === "call" ? new AbortController() : null;
